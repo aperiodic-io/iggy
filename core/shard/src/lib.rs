@@ -10397,7 +10397,7 @@ where
     let action = VsrAction::SendStartView {
         view: consensus.view(),
         op: consensus.sequencer().current_sequence(),
-        commit: consensus.commit_max(),
+        commit: consensus.dvc_commit(),
         incarnation: 0,
         target: None,
         group: consensus.group(),
