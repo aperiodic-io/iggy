@@ -4753,6 +4753,8 @@ where
                         iggy_common::MAX_TOPIC_SEGMENT_SIZE,
                     )?;
                 }
+                TopicCreateOptions::from_resource_options(&admitted.explicit)
+                    .validate_dedup_pair()?;
                 if resolved.max_topic_size.as_bytes_u64() < resolved_segment_size.as_bytes_u64() {
                     return Err(IggyError::InvalidOptionValue(
                         topic_option_keys::MAX_TOPIC_SIZE.to_string(),

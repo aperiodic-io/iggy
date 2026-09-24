@@ -20,7 +20,8 @@ use super::key::OptionKey;
 use super::{
     DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
     DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
+    DedupHeaderName, Durability, MAX_DEDUP_HEADER_LENGTH, MAX_DEDUP_WINDOW_MICROS,
+    MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
     MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE,
     OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions, erase_options,
 };
@@ -29,7 +30,7 @@ use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
 use crate::utils::stream_key::{StreamEncryptionKey, StreamKeyOrigin, WrapSet};
 use crate::wire_conversions::options_block_size;
-use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
+use crate::{IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 use iggy_binary_protocol::{WireHeaderKind, WireOptions, WireUserHeaderEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,7 +68,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 19] = [
+pub static CATALOG: [OptionDescriptor; 21] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -275,6 +276,41 @@ pub static CATALOG: [OptionDescriptor; 19] = [
                  Unsupported or failed reservations fall back to ordinary allocation with a \
                  warning. Reservation runs inline on the owning shard. segment_size * \
                  partitions_count is capped at {MAX_PREALLOCATED_TOPIC_BYTES} bytes per create"
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::DedupWindow,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            format!(
+                "Drop a message whose dedup_header value was already appended to the same \
+                 partition within this window: microseconds or a humantime string (e.g. 5m). \
+                 Absent or 0 disables deduplication. At most {MAX_DEDUP_WINDOW_MICROS} \
+                 microseconds. Requires dedup_header"
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::DedupHeader,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            format!(
+                "User-header key whose value identifies a message for dedup_window, matched \
+                 byte for byte, 1 to {MAX_DEDUP_HEADER_LENGTH} bytes. Messages without it are \
+                 never deduplicated"
             )
         },
     },
@@ -782,6 +818,8 @@ pub fn canonical_value(
         OptionKey::PartitionResizePolicy => PartitionResizePolicy::decode(key, entry)?.encode()?,
         OptionKey::MessagesRequiredToSave => u32::decode(key, entry)?.encode()?,
         OptionKey::PreallocateSegments => bool::decode(key, entry)?.encode()?,
+        OptionKey::DedupWindow => IggyDuration::decode(key, entry)?.encode()?,
+        OptionKey::DedupHeader => DedupHeaderName::decode(key, entry)?.encode()?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }

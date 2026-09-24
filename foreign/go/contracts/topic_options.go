@@ -17,7 +17,10 @@
 
 package iggcon
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"time"
+)
 
 // TopicOptionKey names a topic option of the server catalog.
 type TopicOptionKey string
@@ -39,6 +42,8 @@ const (
 	TopicOptionMessagesRequiredToSave       TopicOptionKey = "messages_required_to_save"
 	TopicOptionSizeOfMessagesRequiredToSave TopicOptionKey = "size_of_messages_required_to_save"
 	TopicOptionPreallocateSegments          TopicOptionKey = "preallocate_segments"
+	TopicOptionDedupWindow                  TopicOptionKey = "dedup_window"
+	TopicOptionDedupHeader                  TopicOptionKey = "dedup_header"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -72,6 +77,10 @@ type TopicOptions struct {
 	SizeOfMessagesRequiredToSave *uint64
 	// PreallocateSegments, see PreallocateSegmentsOption.
 	PreallocateSegments *bool
+	// DedupWindow, see DedupWindowOption.
+	DedupWindow *time.Duration
+	// DedupHeader, see DedupHeaderOption.
+	DedupHeader *string
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -154,6 +163,22 @@ func SizeOfMessagesRequiredToSaveOption(bytes uint64) HeaderEntry {
 // a create whose product crosses its preallocation cap.
 func PreallocateSegmentsOption(enabled bool) HeaderEntry {
 	return boolOption(TopicOptionPreallocateSegments, enabled)
+}
+
+// DedupWindowOption turns on message deduplication for the topic: within the
+// window, a message whose DedupHeaderOption header value was already appended
+// to the same partition is dropped. The window is sent in microseconds and is
+// capped server-side at one day. Zero leaves deduplication off. The server
+// refuses a non-zero window without a header.
+func DedupWindowOption(window time.Duration) HeaderEntry {
+	return uint64Option(TopicOptionDedupWindow, uint64(window/time.Microsecond))
+}
+
+// DedupHeaderOption names the user header whose value identifies a message for
+// DedupWindowOption, matched byte for byte (1 to 64 bytes). Messages without it
+// are never deduplicated.
+func DedupHeaderOption(header string) HeaderEntry {
+	return stringOption(TopicOptionDedupHeader, header)
 }
 
 func stringOption(key TopicOptionKey, value string) HeaderEntry {

@@ -4785,6 +4785,13 @@ where
         if self.partition_consensus.replica_count == 1 && !partition.durability().is_persisted() {
             partition.reanchor_in_memory_to_mint_frontier(partitions.config().segment_size);
         }
+        // The boot paths rebuild the message-dedup index from committed storage
+        // after recovery; so must this one, or a restarted simulated replica
+        // would promote with an index its production counterpart would have.
+        // In-memory reads never suspend on the reactor, so blocking is sound.
+        if partition.message_dedup_policy().is_some() {
+            futures::executor::block_on(partition.rebuild_message_dedup_index());
+        }
         partitions.insert(namespace, partition);
         if self.redispatch_parked_frames(namespace, epoch) {
             // This mutation occurs outside the pump, unlike production's
@@ -8369,6 +8376,11 @@ where
             if contradictions > 0 {
                 self.metrics
                     .record_partition_applied_log_contradictions(contradictions);
+            }
+            let dedup = partition.take_message_dedup_counters();
+            if dedup.dropped > 0 || dedup.evicted_live > 0 {
+                self.metrics
+                    .record_partition_message_dedup(dedup.dropped, dedup.evicted_live);
             }
             // A fenced partition must not tick: its consensus would emit
             // view-scoped sends for a log the cluster has already passed.

@@ -17,12 +17,12 @@
 
 use super::key::OptionKey;
 use super::{
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    PartitionResizePolicy,
+    DedupHeaderName, Durability, MAX_DEDUP_WINDOW_MICROS, MAX_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, PartitionResizePolicy,
 };
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKind, HeaderValue};
-use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
+use crate::{IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 use iggy_binary_protocol::WireUserHeaderEntry;
 use std::str::FromStr;
 
@@ -223,6 +223,46 @@ impl OptionValueCodec for u32 {
 
     fn encode(&self) -> Result<HeaderValue, IggyError> {
         Ok(HeaderValue::from(*self))
+    }
+
+    fn to_option_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl OptionValueCodec for IggyDuration {
+    const KIND: HeaderKind = HeaderKind::Uint64;
+
+    fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        let micros = decode_u64_or(key, entry, |text| {
+            Self::from_str(text)
+                .ok()
+                .map(|duration| duration.as_micros())
+        })?;
+        if key == OptionKey::DedupWindow && micros > MAX_DEDUP_WINDOW_MICROS {
+            return Err(invalid(key));
+        }
+        Ok(Self::from(micros))
+    }
+
+    fn encode(&self) -> Result<HeaderValue, IggyError> {
+        Ok(HeaderValue::from(self.as_micros()))
+    }
+
+    fn to_option_string(&self) -> String {
+        self.as_micros().to_string()
+    }
+}
+
+impl OptionValueCodec for DedupHeaderName {
+    const KIND: HeaderKind = HeaderKind::String;
+
+    fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        parse_text(key, entry, |text| Self::from_str(text).ok())
+    }
+
+    fn encode(&self) -> Result<HeaderValue, IggyError> {
+        HeaderValue::try_from(self.to_string().as_str())
     }
 
     fn to_option_string(&self) -> String {

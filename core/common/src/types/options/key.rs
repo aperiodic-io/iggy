@@ -52,6 +52,8 @@ pub enum OptionKey {
     MessagesRequiredToSave,
     SizeOfMessagesRequiredToSave,
     PreallocateSegments,
+    DedupWindow,
+    DedupHeader,
     EncryptionKey,
     EncryptionKeyWrapped,
     EncryptionKeySource,

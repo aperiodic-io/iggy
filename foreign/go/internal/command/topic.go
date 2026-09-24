@@ -135,6 +135,12 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 	if options.PreallocateSegments != nil {
 		typed = append(typed, iggcon.PreallocateSegmentsOption(*options.PreallocateSegments))
 	}
+	if options.DedupWindow != nil {
+		typed = append(typed, iggcon.DedupWindowOption(*options.DedupWindow))
+	}
+	if options.DedupHeader != nil {
+		typed = append(typed, iggcon.DedupHeaderOption(*options.DedupHeader))
+	}
 	return typed, nil
 }
 

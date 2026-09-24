@@ -165,7 +165,7 @@ pub fn new_shard(
     seed_namespaces: &[(
         server_common::sharding::IggyNamespace,
         u32,
-        iggy_common::Durability,
+        iggy_binary_protocol::WireOptions,
     )],
     applied_frontier: Arc<AppliedFrontier>,
 ) -> (
@@ -391,12 +391,12 @@ pub fn new_shard(
     // seeding again would bring back a fixture topic a committed delete removed.
     if shard_idx == 0 && !has_checkpoint {
         let streams = metadata.mux_stm.streams();
-        for &(namespace, created_view, durability) in seed_namespaces {
-            streams.seed_namespace_with_durability(
-                namespace,
+        for (namespace, created_view, topic_options) in seed_namespaces {
+            streams.seed_namespace_with_options(
+                *namespace,
                 namespace.inner(),
-                created_view,
-                durability,
+                *created_view,
+                topic_options,
             );
         }
     }

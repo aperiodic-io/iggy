@@ -1940,7 +1940,7 @@ impl Streams {
         stream_slab: usize,
         topic_slab: usize,
         target_partitions: &[CreatedPartitionAssignment],
-        durability: iggy_common::Durability,
+        target_options: &WireOptions,
     ) {
         let stream_wire =
             WireIdentifier::numeric(u32::try_from(stream_slab).expect("sim stream slab fits u32"));
@@ -1954,10 +1954,10 @@ impl Streams {
             if present {
                 continue;
             }
-            let partitions = if slab == topic_slab {
-                target_partitions.to_vec()
+            let (partitions, options) = if slab == topic_slab {
+                (target_partitions.to_vec(), target_options.clone())
             } else {
-                Vec::new()
+                (Vec::new(), WireOptions::empty())
             };
             self.inner
                 .try_apply(StreamsCommand::CreateTopicWithAssignments(
@@ -1968,13 +1968,7 @@ impl Streams {
                                 .expect("sim partition count fits u32"),
                             name: WireName::new(Self::seeded_topic_name(stream_slab, slab))
                                 .expect("sim topic name is valid"),
-                            options: iggy_common::TopicCreateOptions {
-                                durability,
-                                consumer_offset_durability: durability,
-                                ..Default::default()
-                            }
-                            .to_wire()
-                            .expect("valid simulator durability options"),
+                            options,
                         },
                         derived_options: WireOptions::empty(),
                         partitions,
@@ -2033,6 +2027,31 @@ impl Streams {
         created_view: u32,
         durability: iggy_common::Durability,
     ) {
+        let options = iggy_common::TopicCreateOptions {
+            durability,
+            consumer_offset_durability: durability,
+            ..Default::default()
+        }
+        .to_wire()
+        .expect("valid simulator durability options");
+        self.seed_namespace_with_options(namespace, consensus_group_id, created_view, &options);
+    }
+
+    /// [`Self::seed_namespace`] with an explicit options block for the
+    /// addressed topic, applied only when that topic is created by this seed.
+    /// Lets a simulator topic carry the option-driven runtime behavior
+    /// (message deduplication, flush thresholds) a real create would.
+    ///
+    /// # Panics
+    /// As [`Self::seed_namespace`].
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn seed_namespace_with_options(
+        &self,
+        namespace: IggyNamespace,
+        consensus_group_id: u64,
+        created_view: u32,
+        topic_options: &WireOptions,
+    ) {
         let stream_slab = namespace.stream_id();
         let topic_slab = namespace.topic_id();
         let partition_id =
@@ -2066,7 +2085,7 @@ impl Streams {
             })
             .collect();
         self.seed_stream_slabs(stream_slab);
-        self.seed_topic_slabs(stream_slab, topic_slab, &target_partitions, durability);
+        self.seed_topic_slabs(stream_slab, topic_slab, &target_partitions, topic_options);
 
         if self.created_revision_for_namespace(namespace).is_some() {
             return;
