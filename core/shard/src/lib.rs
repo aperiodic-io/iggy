@@ -4389,6 +4389,13 @@ where
         // the next mint inside a segment -- a shape boot never produces, so the
         // harness would be modelling something the server cannot reach.
         partition.reanchor_in_memory_to_mint_frontier(partitions.config().segment_size);
+        // The boot paths rebuild the message-dedup index from committed storage
+        // after recovery; so must this one, or a restarted simulated replica
+        // would promote with an index its production counterpart would have.
+        // In-memory reads never suspend on the reactor, so blocking is sound.
+        if partition.message_dedup_policy().is_some() {
+            futures::executor::block_on(partition.rebuild_message_dedup_index());
+        }
         partitions.insert(namespace, partition);
         if self.redispatch_parked_frames(namespace, epoch) {
             // This mutation occurs outside the pump, unlike production's
@@ -7688,6 +7695,11 @@ where
             let gap_drops = partition.take_prepare_gap_drops();
             if gap_drops > 0 {
                 self.metrics.record_partition_prepare_gap_drops(gap_drops);
+            }
+            let dedup = partition.take_message_dedup_counters();
+            if dedup.dropped > 0 || dedup.evicted_live > 0 {
+                self.metrics
+                    .record_partition_message_dedup(dedup.dropped, dedup.evicted_live);
             }
             // A fenced partition must not tick: its consensus would emit
             // view-scoped sends for a log the cluster has already passed.

@@ -20,6 +20,7 @@ package iggcon
 import (
 	"bytes"
 	"testing"
+	"time"
 )
 
 // Keys and value bytes are spelled out rather than taken from the constants and
@@ -54,6 +55,20 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 			wantKey:   "durability",
 			wantKind:  String,
 			wantValue: []byte("replicated"),
+		},
+		{
+			name:      "dedup window of five minutes in micros",
+			entry:     DedupWindowOption(5 * time.Minute),
+			wantKey:   "dedup_window",
+			wantKind:  Uint64,
+			wantValue: []byte{0x00, 0xa3, 0xe1, 0x11, 0, 0, 0, 0},
+		},
+		{
+			name:      "dedup header",
+			entry:     DedupHeaderOption("dedup-key"),
+			wantKey:   "dedup_header",
+			wantKind:  String,
+			wantValue: []byte("dedup-key"),
 		},
 		{
 			name:      "messages required to save",

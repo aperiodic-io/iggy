@@ -22,6 +22,10 @@ use crate::iggy_index_writer::IggyIndexWriter;
 use crate::journal::{MessageLookup, PartitionJournal, PartitionJournalMemStorage};
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
+use crate::message_dedup::{
+    DEFAULT_MESSAGE_DEDUP_ENTRIES_MAX, DedupCounters, DedupKey, MessageDedupIndex, REBUILT_OP,
+    classify_batch, record_committed_batch, record_pending_batch,
+};
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
     PURGE_GENERATION_FILE, delete_persisted_offset, delete_persisted_offset_with_storage,
@@ -68,7 +72,7 @@ use iggy_binary_protocol::{PrepareOkHeader, ReplyHeader, RoutedRequestHeader};
 use iggy_common::{
     ConsumerGroupId, ConsumerGroupOffsets, ConsumerKind, ConsumerOffset, ConsumerOffsets,
     IggyByteSize, IggyError, IggyExpiry, IggyTimestamp, PartitionStats, PollingKind,
-    TopicRuntimeOptions,
+    PollingStrategy, TopicRuntimeOptions,
 };
 use journal::Journal as _;
 use journal::durable_storage::{DiskStorage, DurableStorage};
@@ -83,8 +87,9 @@ use server_common::{
     Message, SegmentStorage,
     iobuf::Frozen,
     send_messages::{
-        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_slice,
-        decode_prepare_slice_trusted, stamp_prepare_for_persistence,
+        BatchHeader, BatchIntegrity, ChecksumMode, convert_request_message,
+        decode_batch_slice_with, decode_prepare_slice, decode_prepare_slice_trusted,
+        retain_batch_messages, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
 };
@@ -132,6 +137,13 @@ where
     /// group, where preallocating the cap would reserve hundreds of KiB per
     /// partition before a client connects).
     dedup: ClientTable,
+    /// Content deduplication index for topics with a `dedup_window`. Derived
+    /// from the log on every replica; see [`crate::message_dedup`]. A
+    /// `RefCell` because the primary screens a request while `consensus` is
+    /// borrowed from `self`; no borrow is ever held across an await.
+    message_dedup: RefCell<MessageDedupIndex>,
+    /// Whether this node encrypts at rest; see [`AtRestEncryption`].
+    at_rest_encryption: AtRestEncryption,
     pub log: SegmentedLog<PartitionJournal<PartitionJournalMemStorage>>,
     /// Highest durably persisted offset.
     pub offset: Arc<AtomicU64>,
@@ -589,6 +601,8 @@ where
                 consensus::PARTITION_DEDUP_CLIENTS_MAX,
                 ClientTableMode::PartitionSlice,
             ),
+            message_dedup: RefCell::new(MessageDedupIndex::new(DEFAULT_MESSAGE_DEDUP_ENTRIES_MAX)),
+            at_rest_encryption: AtRestEncryption::Off,
             log: SegmentedLog::default(),
             offset: Arc::new(AtomicU64::new(0)),
             dirty_offset: AtomicU64::new(0),
@@ -748,6 +762,415 @@ where
     /// validation rejects a zero cap before it can reach here.
     pub fn set_dedup_clients_max(&mut self, clients_max: usize) {
         self.dedup.set_capacity(clients_max);
+    }
+
+    /// Cap the content-dedup index at `[partition] message_dedup_entries_max`.
+    pub fn set_message_dedup_entries_max(&mut self, entries_max: usize) {
+        let window = self
+            .message_dedup_policy()
+            .map_or(0, |policy| policy.window_micros());
+        self.message_dedup
+            .get_mut()
+            .set_entries_max(entries_max, window);
+    }
+
+    /// Declare that this node encrypts payloads and user headers at rest.
+    /// Content dedup reads a header value, which is ciphertext under a random
+    /// nonce once encrypted, so a topic's dedup policy is ignored here.
+    pub fn set_at_rest_encryption(&mut self, enabled: bool) {
+        self.at_rest_encryption = if enabled {
+            AtRestEncryption::On
+        } else {
+            AtRestEncryption::Off
+        };
+        if enabled && self.runtime_options.message_dedup.is_some() {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = self.namespace().inner(),
+                "topic sets dedup_window but encryption at rest is on: message deduplication is disabled for this partition"
+            );
+        }
+    }
+
+    /// The dedup policy this partition enforces, if any.
+    #[must_use]
+    pub const fn message_dedup_policy(&self) -> Option<iggy_common::MessageDedupPolicy> {
+        match self.at_rest_encryption {
+            AtRestEncryption::On => None,
+            AtRestEncryption::Off => self.runtime_options.message_dedup,
+        }
+    }
+
+    /// Forget the whole content-dedup index: the log it was derived from was
+    /// replaced (state-transfer install) or reset.
+    pub(crate) fn clear_message_dedup_index(&mut self) {
+        self.message_dedup.get_mut().clear();
+    }
+
+    /// Number of keys in the content-dedup index.
+    #[must_use]
+    pub fn message_dedup_len(&self) -> usize {
+        self.message_dedup.borrow().len()
+    }
+
+    /// Order-independent digest of the committed half of the content-dedup
+    /// index. Replicas at the same commit hold the same one.
+    #[must_use]
+    pub fn message_dedup_fingerprint(&self) -> u128 {
+        self.message_dedup.borrow().fingerprint()
+    }
+
+    /// The content-dedup index as `(key, offset, timestamp, op)`, sorted.
+    /// Diagnostics only.
+    #[must_use]
+    pub fn message_dedup_entries(&self) -> Vec<(u128, u64, u64, u64)> {
+        self.message_dedup.borrow().entries_sorted()
+    }
+
+    /// Counters accumulated since the last drain, reset on read.
+    pub fn take_message_dedup_counters(&self) -> DedupCounters {
+        self.message_dedup.borrow_mut().take_counters()
+    }
+
+    /// Screen a routed `SendMessages` request against the dedup index, on the
+    /// primary, immediately before it is projected into a prepare. Removes the
+    /// duplicates from the batch; see [`crate::message_dedup`].
+    fn screen_duplicate_messages(&self, message: Message<RoutedRequestHeader>) -> DedupScreen {
+        if message.header().operation != Operation::SendMessages {
+            return DedupScreen::Proceed {
+                message,
+                kept_keys: None,
+            };
+        }
+        let Some(policy) = self.message_dedup_policy() else {
+            return DedupScreen::Proceed {
+                message,
+                kept_keys: None,
+            };
+        };
+        let now = self.consensus.clock_realtime_micros();
+        let verdict = {
+            let total_size = message.header().size as usize;
+            let Some(body) = message
+                .as_slice()
+                .get(std::mem::size_of::<RoutedRequestHeader>()..total_size)
+            else {
+                return DedupScreen::Proceed {
+                    message,
+                    kept_keys: None,
+                };
+            };
+            let Ok(batch) = decode_batch_slice_with(body, BatchIntegrity::LayoutOnly) else {
+                // Admission already decoded this batch; an undecodable one is
+                // refused downstream exactly as it would be without dedup.
+                return DedupScreen::Proceed {
+                    message,
+                    kept_keys: None,
+                };
+            };
+            classify_batch(
+                &batch,
+                &policy,
+                &self.message_dedup.borrow(),
+                now,
+                self.consensus.commit_min(),
+            )
+        };
+        if verdict.matched_uncommitted {
+            self.message_dedup.borrow_mut().note_deferred();
+            return DedupScreen::Deferred {
+                header: *message.header(),
+            };
+        }
+        if verdict.keeps_all() {
+            return DedupScreen::Proceed {
+                message,
+                kept_keys: Some(verdict.kept_keys),
+            };
+        }
+        self.message_dedup
+            .borrow_mut()
+            .note_dropped(verdict.dropped);
+        if verdict.keeps_none() {
+            return DedupScreen::AllDuplicates {
+                header: *message.header(),
+            };
+        }
+        let keep = verdict.keep;
+        match retain_batch_messages(message, |index| keep[index]) {
+            Ok(Some(message)) => DedupScreen::Proceed {
+                message,
+                kept_keys: Some(verdict.kept_keys),
+            },
+            // Unreachable: keeps_none() was ruled out and the batch decoded.
+            // Refusing transiently is the answer that can never lose data.
+            Ok(None) | Err(_) => DedupScreen::Deferred {
+                header: RoutedRequestHeader::default(),
+            },
+        }
+    }
+
+    /// Record the keys the primary just admitted, tagged with the op
+    /// `project` assigned, so a request screened before this prepare is
+    /// journaled already sees them. The append path confirms them with the
+    /// stamped offsets.
+    fn record_admitted_dedup_keys(
+        &self,
+        prepare: &Message<PrepareHeader>,
+        kept_keys: Option<Vec<Option<DedupKey>>>,
+    ) {
+        let (Some(kept_keys), true) = (kept_keys, self.message_dedup_policy().is_some()) else {
+            return;
+        };
+        let header = prepare.header();
+        let provisional_base = self.mint_frontier();
+        let mut index = self.message_dedup.borrow_mut();
+        for (position, key) in kept_keys.into_iter().enumerate() {
+            if let Some(key) = key {
+                index.record_pending(
+                    key,
+                    provisional_base + position as u64,
+                    header.timestamp,
+                    header.op,
+                );
+            }
+        }
+    }
+
+    /// Answer a request the dedup screen resolved without replicating it:
+    /// every message a committed duplicate (success), or some message
+    /// matching an uncommitted occurrence (retry, since whether it is a
+    /// duplicate depends on whether that occurrence commits).
+    async fn answer_dedup_screen(
+        consensus: &VsrConsensus<B>,
+        header: &RoutedRequestHeader,
+        deferred: bool,
+        waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) {
+        if deferred {
+            Self::send_partition_deny_or_log(
+                consensus,
+                header,
+                IggyError::TransientNotCommitted.as_code(),
+                "dedup deferred reply send failed",
+                waiter,
+            )
+            .await;
+            return;
+        }
+        if waiter.is_none() && is_auto_commit_client(header.client) {
+            return;
+        }
+        // Only `SendMessages` is screened. Its reply must carry the
+        // confirmation section even when nothing was appended: SDKs read an
+        // empty status-0 send reply as a send that wrote nothing. Zero
+        // confirmations is the "committed, no placement" answer.
+        let reply = build_reply_from_request(consensus, header, send_messages_reply_body(0, None));
+        Self::deliver_reply_or_log(
+            consensus,
+            header,
+            reply,
+            waiter,
+            "dedup duplicate reply send failed",
+        )
+        .await;
+    }
+
+    /// Fold a batch that was just appended to the journal, whatever path
+    /// appended it.
+    fn record_appended_batch(&self, header: &PrepareHeader, prepare: &[u8]) {
+        let Some(policy) = self.message_dedup_policy() else {
+            return;
+        };
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let Some(body) = prepare.get(header_size..header.size as usize) else {
+            return;
+        };
+        record_pending_batch(
+            &mut self.message_dedup.borrow_mut(),
+            &policy,
+            body,
+            header.op,
+        );
+    }
+
+    /// Fold the batch of an op the commit walk just reached. Runs on every
+    /// replica, from the journaled bytes, before the local commit can flush
+    /// and evict them.
+    fn record_committed_op(&self, header: &PrepareHeader) {
+        if header.operation != Operation::SendMessages {
+            return;
+        }
+        let Some(policy) = self.message_dedup_policy() else {
+            return;
+        };
+        let mut index = self.message_dedup.borrow_mut();
+        let Some(entry) = self.log.journal().inner.repair_entry(header.op) else {
+            // The keys of this op go unindexed, which can only let a later
+            // duplicate through. The sweep still runs, so no pending key at or
+            // below it survives.
+            index.note_unconfirmed_commit();
+            index.sweep_committed_through(header.op);
+            return;
+        };
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        if let Some(body) = entry.get(header_size..header.size as usize) {
+            record_committed_batch(&mut index, &policy, body, header.op);
+        } else {
+            index.note_unconfirmed_commit();
+            index.sweep_committed_through(header.op);
+        }
+    }
+
+    /// Rebuild the dedup index from committed storage: the window's worth of
+    /// segments and resident journal behind the commit frontier.
+    ///
+    /// Run at boot and after a state-transfer install, the two ways a replica
+    /// gains committed log without appending it. Entries already folded by
+    /// WAL replay or repair are kept (matched by offset), so it is safe to run
+    /// after them. Reads a margin past the window to absorb clock skew between
+    /// this node and the stamps in the log; eviction trims the excess.
+    ///
+    /// Returns the number of messages folded.
+    pub async fn rebuild_message_dedup_index(&mut self) -> u64 {
+        const REBUILD_CLOCK_MARGIN_MICROS: u64 = 60 * 1_000_000;
+        let Some(policy) = self.message_dedup_policy() else {
+            self.message_dedup.get_mut().clear();
+            return 0;
+        };
+        let window = policy.window_micros();
+        let from = self
+            .consensus
+            .clock_realtime_micros()
+            .saturating_sub(window)
+            .saturating_sub(REBUILD_CLOCK_MARGIN_MICROS);
+        let mut folded = 0u64;
+        let mut keyed = Vec::new();
+        self.walk_committed_messages(
+            PollingStrategy::timestamp(IggyTimestamp::from(from)),
+            |offset, timestamp, user_headers| {
+                folded += 1;
+                if let Some(key) = crate::message_dedup::dedup_key(user_headers, &policy.header) {
+                    keyed.push((key, offset, timestamp));
+                }
+            },
+        )
+        .await;
+        let index = self.message_dedup.get_mut();
+        for (key, offset, timestamp) in keyed {
+            index.record_committed(key, offset, timestamp, REBUILT_OP, window);
+        }
+        // The resident journal can hold ops past the commit frontier that no
+        // append on this incarnation folded: a restart that kept its journal,
+        // or an install whose repaired tail is already resident. They may
+        // still commit, so they are indexed under their real ops, where a
+        // truncation can roll them back. Committed entries folded above are
+        // matched by offset and only gain their op.
+        for entry in self.log.journal().inner.resident_message_entries() {
+            let Some(header_bytes) = entry.get(..std::mem::size_of::<PrepareHeader>()) else {
+                continue;
+            };
+            let Ok(header) = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
+            else {
+                continue;
+            };
+            let header = *header;
+            if header.operation != Operation::SendMessages || header.op <= self.purge_floor_op {
+                continue;
+            }
+            if header.op <= self.consensus.commit_min() {
+                let body = entry.get(std::mem::size_of::<PrepareHeader>()..header.size as usize);
+                if let Some(body) = body {
+                    record_committed_batch(self.message_dedup.get_mut(), &policy, body, header.op);
+                }
+            } else {
+                self.record_appended_batch(&header, &entry);
+            }
+        }
+        // Nothing at or below the commit point may stay pending: those ops
+        // are committed and were indexed above, or are gone.
+        self.message_dedup
+            .get_mut()
+            .sweep_committed_through(self.consensus.commit_min());
+        folded
+    }
+
+    /// Every committed message from `start` up to the commit frontier, as
+    /// `(offset, batch timestamp, user headers)`, read through the ordinary
+    /// poll tiers (resident journal and segments).
+    async fn walk_committed_messages(
+        &mut self,
+        start: PollingStrategy,
+        mut visit: impl FnMut(u64, u64, &[u8]),
+    ) {
+        const WALK_POLL_COUNT: u32 = 4096;
+        let mut strategy = start;
+        loop {
+            let args = PollingArgs {
+                strategy,
+                count: WALK_POLL_COUNT,
+                auto_commit: false,
+            };
+            let plan = self.build_poll_plan(PollingConsumer::Consumer(0, 0), &args, false);
+            let result = plan.execute().await;
+            let mut last_offset: Option<u64> = None;
+            for fragment in &result.fragments {
+                let mut record = fragment.as_slice();
+                while let Ok(batch) = decode_batch_slice_with(record, BatchIntegrity::LayoutOnly) {
+                    let size = batch.header.total_size();
+                    for view in &batch {
+                        let offset = batch.header.base_offset + u64::from(view.header.offset_delta);
+                        last_offset = Some(last_offset.map_or(offset, |last| last.max(offset)));
+                        visit(offset, batch.header.base_timestamp, view.user_headers);
+                    }
+                    let Some(rest) = record.get(size..) else {
+                        break;
+                    };
+                    record = rest;
+                }
+            }
+            match last_offset {
+                Some(last) if last < result.commit_offset => {
+                    strategy = PollingStrategy::offset(last + 1);
+                    // Only disk-backed partitions hand the core back between
+                    // chunks: the yield needs the compio reactor, which an
+                    // in-memory (simulator) partition does not run under.
+                    if self.partition_dir.is_some() {
+                        server_common::yield_to_reactor().await;
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+
+    /// Every committed message as `(offset, batch timestamp)`, oldest first.
+    /// Test and simulator accessor.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn committed_message_timestamps(&mut self) -> Vec<(u64, u64)> {
+        let mut messages = Vec::new();
+        self.walk_committed_messages(PollingStrategy::offset(0), |offset, timestamp, _| {
+            messages.push((offset, timestamp));
+        })
+        .await;
+        messages.sort_unstable();
+        messages.dedup_by_key(|(offset, _)| *offset);
+        messages
+    }
+
+    /// Every committed message as `(offset, user headers)`, oldest first.
+    /// Test and simulator accessor for checking what the log holds.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn committed_message_headers(&mut self) -> Vec<(u64, Vec<u8>)> {
+        let mut messages = Vec::new();
+        self.walk_committed_messages(PollingStrategy::offset(0), |offset, _, user_headers| {
+            messages.push((offset, user_headers.to_vec()));
+        })
+        .await;
+        messages.sort_unstable_by_key(|(offset, _)| *offset);
+        messages.dedup_by_key(|(offset, _)| *offset);
+        messages
     }
 
     /// Set the per-kind durable consumer-offset limit for this partition.
@@ -4583,7 +5006,21 @@ where
                     return;
                 }
 
+                // No await between the screen and `project`: a sibling request
+                // interleaving there could miss the keys recorded below.
+                let (message, dedup_keys) = match self.screen_duplicate_messages(message) {
+                    DedupScreen::Proceed { message, kept_keys } => (message, kept_keys),
+                    DedupScreen::AllDuplicates { header } => {
+                        Self::answer_dedup_screen(consensus, &header, false, reply.take()).await;
+                        return;
+                    }
+                    DedupScreen::Deferred { header } => {
+                        Self::answer_dedup_screen(consensus, &header, true, reply.take()).await;
+                        return;
+                    }
+                };
                 let prepare = message.project(consensus);
+                self.record_admitted_dedup_keys(&prepare, dedup_keys);
                 consensus.verify_pipeline();
                 match reply.take() {
                     Some(sender) => consensus.pipeline_message_with_sender(
@@ -4735,6 +5172,32 @@ where
                     continue;
                 }
             }
+            let (message, dedup_keys) = match self.screen_duplicate_messages(req.message) {
+                DedupScreen::Proceed { message, kept_keys } => (message, kept_keys),
+                DedupScreen::AllDuplicates { header } => {
+                    Self::answer_dedup_screen(
+                        self.consensus(),
+                        &header,
+                        false,
+                        reply_sender.take(),
+                    )
+                    .await;
+                    consecutive_denials += 1;
+                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                        break;
+                    }
+                    continue;
+                }
+                DedupScreen::Deferred { header } => {
+                    Self::answer_dedup_screen(self.consensus(), &header, true, reply_sender.take())
+                        .await;
+                    consecutive_denials += 1;
+                    if consecutive_denials >= PROMOTION_DENIALS_MAX {
+                        break;
+                    }
+                    continue;
+                }
+            };
             consecutive_denials = 0;
 
             let prepare = {
@@ -4753,7 +5216,8 @@ where
                 );
                 // The waiter parked with the request; it must travel into the
                 // prepare slot or the commit has nobody to answer.
-                let prepare = req.message.project(consensus);
+                let prepare = message.project(consensus);
+                self.record_admitted_dedup_keys(&prepare, dedup_keys);
                 consensus.verify_pipeline();
                 match reply_sender {
                     Some(sender) => consensus.pipeline_message_with_sender(
@@ -5577,8 +6041,10 @@ where
         journal_info.end_timestamp = batch.base_timestamp;
         journal_info.max_timestamp = journal_info.max_timestamp.max(batch.base_timestamp);
 
+        let prepare_header = *message.header();
         let frozen = message.into_frozen();
         self.journal_append(frozen.clone()).await?;
+        self.record_appended_batch(&prepare_header, frozen.as_slice());
 
         self.note_append_live();
         self.dirty_offset
@@ -5694,6 +6160,7 @@ where
         self.pending_consumer_offset_commits
             .retain(|op, _| *op < from_op || *op <= commit_max);
         self.offset_reservations_need_resync.set(true);
+        self.message_dedup.get_mut().truncate_from_op(from_op);
         Ok(removed)
     }
 
@@ -6169,6 +6636,7 @@ where
         }
         for (entry, batch_stats) in drained.iter().zip(&committed_batch_stats) {
             let prepare_header = entry.header;
+            self.record_committed_op(&prepare_header);
             if !self
                 .commit_partition_entry(
                     prepare_header,
@@ -7712,6 +8180,8 @@ where
         }
         self.record_purge_frontier_reset(generation).await?;
         self.invalidate_poll_history();
+        // The offset space restarts at 0, so every indexed offset is gone.
+        self.message_dedup.get_mut().clear();
 
         // The purge recreates segment files at the paths it unlinks below, so
         // an in-flight poll's cached read fd would keep serving the unlinked
@@ -8437,8 +8907,10 @@ where
         journal_info.end_timestamp = base_timestamp;
         journal_info.max_timestamp = journal_info.max_timestamp.max(base_timestamp);
 
+        let prepare_header = *message.header();
         let frozen = message.into_frozen();
-        self.journal_append(frozen).await?;
+        self.journal_append(frozen.clone()).await?;
+        self.record_appended_batch(&prepare_header, frozen.as_slice());
 
         self.note_append_live();
         self.dirty_offset
@@ -8634,6 +9106,30 @@ fn journaled_prepare_matches_retransmit(
 /// explicit empty result section (`[count = 0]`) so the SDK's framed decode
 /// does not misread the payload; every other partition op replies with an
 /// empty body.
+/// Payloads and user headers are encrypted before the partition sees them
+/// when this is `On`, so header values cannot be compared and content dedup
+/// stays off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtRestEncryption {
+    Off,
+    On,
+}
+
+/// Outcome of screening one request for duplicate messages.
+enum DedupScreen {
+    /// Project this (possibly filtered) request. `kept_keys` is `Some` when a
+    /// dedup policy screened it.
+    Proceed {
+        message: Message<RoutedRequestHeader>,
+        kept_keys: Option<Vec<Option<DedupKey>>>,
+    },
+    /// Every message was a committed duplicate: answer success without
+    /// replicating anything.
+    AllDuplicates { header: RoutedRequestHeader },
+    /// Some message matched an uncommitted occurrence: refuse transiently.
+    Deferred { header: RoutedRequestHeader },
+}
+
 const fn committed_reply_body(operation: Operation) -> bytes::Bytes {
     if operation.is_result_framed() {
         bytes::Bytes::from_static(&[0, 0, 0, 0])

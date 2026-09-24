@@ -34,7 +34,7 @@ use deps::SimClock;
 use deps::SimSuperblock;
 use deps::{MemStorage, SimJournal};
 use executor::{DetExecutor, RunOutcome, TaskId};
-use iggy_binary_protocol::{Command, GenericHeader, PrepareHeader, ReplyHeader};
+use iggy_binary_protocol::{Command, GenericHeader, PrepareHeader, ReplyHeader, WireOptions};
 use iggy_common::IggyError;
 use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use metadata::impls::metadata::StreamsFrontend;
@@ -237,6 +237,9 @@ pub struct Simulator {
     /// routing. Set at construction by [`Simulator::with_shards_shell`].
     shell: bool,
     consumer_offsets_max: usize,
+    /// Topic option blocks seeded with a namespace's topic, applied on first
+    /// materialisation and on every restart (see [`Self::set_topic_options`]).
+    topic_options: HashMap<IggyNamespace, WireOptions>,
 }
 
 impl Simulator {
@@ -538,7 +541,16 @@ impl Simulator {
             seed,
             shell,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
+            topic_options: HashMap::new(),
         }
+    }
+
+    /// Give `namespace`'s topic an explicit options block, as a real
+    /// `CreateTopic` would carry it (message deduplication, flush thresholds).
+    /// Must precede [`Self::init_partition`] for that namespace; restarts
+    /// re-apply it, as a rebooted server re-reads the committed topic.
+    pub fn set_topic_options(&mut self, namespace: IggyNamespace, options: WireOptions) {
+        self.topic_options.insert(namespace, options);
     }
 
     /// Configure the per-kind offset limit used by partitions materialised
@@ -604,6 +616,7 @@ impl Simulator {
                 self.restore_partition_frontier,
                 created_view,
                 self.consumer_offsets_max,
+                self.topic_options.get(&namespace),
             );
         }
     }
@@ -1223,11 +1236,18 @@ impl Simulator {
         // an unsorted walk would stop replay being byte-identical. Also drives the
         // re-materialisation loop below, which must agree with it. Each carries the
         // view it was created in, as the metadata a real boot replays would.
-        let mut seed_namespaces: Vec<(IggyNamespace, u32)> = partition_superblocks
-            .keys()
-            .map(|&namespace| (namespace, self.partition_created_views[&namespace]))
-            .collect();
-        seed_namespaces.sort_unstable_by_key(|(namespace, _)| namespace.inner());
+        let mut seed_namespaces: Vec<(IggyNamespace, u32, Option<WireOptions>)> =
+            partition_superblocks
+                .keys()
+                .map(|&namespace| {
+                    (
+                        namespace,
+                        self.partition_created_views[&namespace],
+                        self.topic_options.get(&namespace).cloned(),
+                    )
+                })
+                .collect();
+        seed_namespaces.sort_unstable_by_key(|(namespace, _, _)| namespace.inner());
 
         // Durable VSR state from the retained superblock, before the rebuild, as
         // production reads it in `restore_metadata_consensus`.
@@ -1317,13 +1337,14 @@ impl Simulator {
         // makes the carried-forward superblock load-bearing: the group recovers its
         // recorded `(view, log_view)` instead of re-entering view 0. The metadata half
         // of the seed already ran inside `new_shard`, ahead of the replay.
-        for (namespace, created_view) in seed_namespaces {
+        for (namespace, created_view, topic_options) in seed_namespaces {
             materialise_partition(
                 &self.replicas[idx],
                 namespace,
                 self.restore_partition_frontier,
                 created_view,
                 self.consumer_offsets_max,
+                topic_options.as_ref(),
             );
         }
 
@@ -1623,6 +1644,7 @@ fn materialise_partition(
     restore_frontier: bool,
     created_view: u32,
     consumer_offsets_max: usize,
+    topic_options: Option<&WireOptions>,
 ) {
     let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
     let owner = calculate_shard_assignment(&namespace, shard_count);
@@ -1630,7 +1652,17 @@ fn materialise_partition(
     // a shape production cannot produce, and the shard refuses client traffic whose
     // routing-row epoch it cannot match against a committed `created_revision`.
     let streams = replica.shards[0].plane.metadata().mux_stm.streams();
-    streams.seed_namespace(namespace, namespace.inner(), created_view);
+    match topic_options {
+        Some(options) => {
+            streams.seed_namespace_with_options(
+                namespace,
+                namespace.inner(),
+                created_view,
+                options,
+            );
+        }
+        None => streams.seed_namespace(namespace, namespace.inner(), created_view),
+    }
     // No committed revision means the seed could not re-add the namespace, which
     // happens once a metadata workload has deleted its stream or topic: the seed's
     // `CreatePartitions` is then a committed REJECTION rather than an error, so it
@@ -1680,6 +1712,9 @@ fn materialise_partition(
         );
     }
 }
+
+#[cfg(test)]
+mod message_dedup_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3026,6 +3061,7 @@ mod tests {
             false,
             created_view,
             sim.consumer_offsets_max,
+            None,
         );
         materialise_partition(
             &sim.replicas[2],
@@ -3033,6 +3069,7 @@ mod tests {
             false,
             created_view,
             sim.consumer_offsets_max,
+            None,
         );
 
         let client = SimClient::new(CLIENT_ID);
@@ -3091,6 +3128,7 @@ mod tests {
             false,
             created_view,
             sim.consumer_offsets_max,
+            None,
         );
         assert_eq!(lagging_shard.parked_frame_count(namespace), 0);
         assert_eq!(

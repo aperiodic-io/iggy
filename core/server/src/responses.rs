@@ -620,6 +620,7 @@ where
 /// Every default is a build constant: these knobs stopped being config-derived
 /// when the `[system.*]` keys became topic options, so the catalog reads them
 /// straight from `iggy_common`.
+#[allow(clippy::too_many_lines)]
 fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
     Ok(vec![
         OptionDescriptor {
@@ -714,6 +715,30 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
                      with a warning. Reservation runs inline on the owning shard. \
                      segment_size * partitions_count is capped at {} bytes per create",
                 iggy_common::MAX_PREALLOCATED_TOPIC_BYTES
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::DEDUP_WINDOW)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::Uint64.as_code(),
+            default_value: Bytes::copy_from_slice(&0u64.to_le_bytes()),
+            description: format!(
+                "Drop a message whose dedup_header value was already appended to the same \
+                     partition within this window: micros or a humantime string (5m). \
+                     0 disables deduplication. At most {} micros. Requires dedup_header",
+                iggy_common::MAX_DEDUP_WINDOW_MICROS
+            ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::DEDUP_HEADER)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::new(),
+            description: format!(
+                "User-header key whose value identifies a message for dedup_window, \
+                     matched byte for byte, 1..={} bytes. Messages without it are never \
+                     deduplicated",
+                iggy_common::MAX_DEDUP_HEADER_LENGTH
             ),
         },
     ])

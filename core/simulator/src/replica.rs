@@ -156,7 +156,11 @@ pub fn new_shard(
     recovered_state: Option<VsrState>,
     incarnation: u128,
     data_dir: Option<std::path::PathBuf>,
-    seed_namespaces: &[(server_common::sharding::IggyNamespace, u32)],
+    seed_namespaces: &[(
+        server_common::sharding::IggyNamespace,
+        u32,
+        Option<iggy_binary_protocol::WireOptions>,
+    )],
     applied_frontier: Arc<AppliedFrontier>,
 ) -> (Rc<Replica>, Option<SimMetadataBundle>) {
     // Metadata is single-writer, mirroring the server bootstrap. Shard 0 owns
@@ -330,8 +334,16 @@ pub fn new_shard(
     // `materialise_partition`'s own seed is then a no-op.
     if shard_idx == 0 {
         let streams = metadata.mux_stm.streams();
-        for &(namespace, created_view) in seed_namespaces {
-            streams.seed_namespace(namespace, namespace.inner(), created_view);
+        for (namespace, created_view, topic_options) in seed_namespaces {
+            match topic_options {
+                Some(options) => streams.seed_namespace_with_options(
+                    *namespace,
+                    namespace.inner(),
+                    *created_view,
+                    options,
+                ),
+                None => streams.seed_namespace(*namespace, namespace.inner(), *created_view),
+            }
         }
     }
 
