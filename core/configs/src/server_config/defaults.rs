@@ -194,6 +194,7 @@ impl Default for PartitionConfig {
             prepare_queue_depth: partition.prepare_queue_depth as usize,
             dedup_clients_max: partition.dedup_clients_max as usize,
             consumer_offsets_max: partition.consumer_offsets_max as usize,
+            message_dedup_entries_max: partition.message_dedup_entries_max as usize,
 
             offset_reservation_lease: NonZeroU32::new(partition.offset_reservation_lease as u32)
                 .expect("the embedded config.toml carries a nonzero offset_reservation_lease"),

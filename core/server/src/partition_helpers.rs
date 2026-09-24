@@ -979,6 +979,8 @@ async fn load_partition(
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
     partition.set_dedup_clients_max(config.partition.dedup_clients_max);
+    partition.set_message_dedup_entries_max(config.partition.message_dedup_entries_max);
+    partition.set_at_rest_encryption(config.encryption.enabled);
     partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir.clone());
@@ -1016,6 +1018,9 @@ async fn load_partition(
     .await?;
 
     open_partition_persistence(&mut partition, config, recovered_persistence).await?;
+    // After WAL replay, which already folded the replayed tail: the rebuild
+    // adds the committed history before it that only segments still hold.
+    partition.rebuild_message_dedup_index().await;
     Ok(partition)
 }
 
@@ -1468,6 +1473,8 @@ pub async fn build_partition_fresh(
         config.partition.evicted_ring_bytes_max.as_bytes_u64(),
     );
     partition.set_dedup_clients_max(config.partition.dedup_clients_max);
+    partition.set_message_dedup_entries_max(config.partition.message_dedup_entries_max);
+    partition.set_at_rest_encryption(config.encryption.enabled);
     partition.set_consumer_offsets_max(config.partition.consumer_offsets_max);
     partition.set_offset_reservation_lease(config.partition.offset_reservation_lease);
     partition.set_partition_dir(partition_dir);

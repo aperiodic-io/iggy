@@ -967,6 +967,16 @@ dedup_clients_max = 4096
 # Must be > 0 and <= 262144.
 consumer_offsets_max = 4096
 
+# Distinct message-dedup keys each partition keeps for topics that set
+# `dedup_window` (integer). Only such topics pay for it: about 64 bytes per key,
+# so the default bounds one partition's index near 64 MiB. Size it to the
+# distinct keys a partition receives within its topic's window. At the cap the
+# oldest keys are evicted even inside the window, which weakens deduplication
+# (a late duplicate can slip through) but never loses a message; the
+# partition_message_dedup_evicted_live_total metric counts those evictions.
+# Must be > 0 and <= 16777216.
+message_dedup_entries_max = 1000000
+
 # Consumer-offset durability is selected per topic by consumer_offset_durability.
 # It independently defaults to replicated, just like message durability.
 # Poll auto-commit submits an offset write asynchronously. A poll response does

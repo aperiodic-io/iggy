@@ -2782,6 +2782,9 @@ where
                 next_offset,
             )
             .await;
+        // Whatever the outcome, the log the index described is gone: a success
+        // replaced it, a failure drained it.
+        self.clear_message_dedup_index();
         if outcome.is_err() {
             if self.persistence.is_some() {
                 // Keep the rollback snapshot intact until boot reopens every file.
@@ -2847,6 +2850,12 @@ where
                     source,
                 })?;
             self.materialization_missing = false;
+        }
+        if outcome.is_ok() {
+            // An installed log arrives as segments, never as appends, so the
+            // index is rebuilt from it; the repaired tail that follows is
+            // folded by the append path as usual.
+            self.rebuild_message_dedup_index().await;
         }
         outcome
     }

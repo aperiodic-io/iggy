@@ -17,7 +17,10 @@
 
 package iggcon
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"time"
+)
 
 // Topic option keys that CreateTopic has no parameter of its own for.
 //
@@ -34,6 +37,8 @@ const (
 	topicOptionMessagesRequiredToSave       = "messages_required_to_save"
 	topicOptionSizeOfMessagesRequiredToSave = "size_of_messages_required_to_save"
 	topicOptionPreallocateSegments          = "preallocate_segments"
+	topicOptionDedupWindow                  = "dedup_window"
+	topicOptionDedupHeader                  = "dedup_header"
 )
 
 // SegmentSizeOption sets how large a partition segment grows before it rotates.
@@ -77,6 +82,25 @@ func SizeOfMessagesRequiredToSaveOption(bytes uint64) HeaderEntry {
 // a create whose product crosses its preallocation cap.
 func PreallocateSegmentsOption(enabled bool) HeaderEntry {
 	return boolOption(topicOptionPreallocateSegments, enabled)
+}
+
+// DedupWindowOption turns on message deduplication for the topic: within the
+// window, a message whose DedupHeaderOption header value was already appended
+// to the same partition is dropped. The window is sent in microseconds and is
+// capped server-side at one day. Zero leaves deduplication off. The server
+// refuses a non-zero window without a header.
+func DedupWindowOption(window time.Duration) HeaderEntry {
+	return uint64Option(topicOptionDedupWindow, uint64(window/time.Microsecond))
+}
+
+// DedupHeaderOption names the user header whose value identifies a message for
+// DedupWindowOption, matched byte for byte (1 to 64 bytes). Messages without it
+// are never deduplicated.
+func DedupHeaderOption(header string) HeaderEntry {
+	return HeaderEntry{
+		Key:   HeaderKey{Kind: String, Value: []byte(topicOptionDedupHeader)},
+		Value: HeaderValue{Kind: String, Value: []byte(header)},
+	}
 }
 
 func uint64Option(key string, value uint64) HeaderEntry {

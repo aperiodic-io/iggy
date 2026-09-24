@@ -349,6 +349,77 @@ pub fn encrypt_batch_request(
     SendMessagesOwned { header, blob }.encode_request(request_header)
 }
 
+/// Rebuild a routed `SendMessages` request keeping only the messages whose
+/// index `keep` accepts, in their original order.
+///
+/// The kept messages are renumbered to dense `offset_delta`s `0..k`: the
+/// partition assigns offsets `base..base + message_count`, and readers resolve
+/// a message as `base + offset_delta`, so a gap left by a dropped message would
+/// make two batches claim the same offset. Every kept message's checksum is
+/// recomputed (it covers `offset_delta`), and `message_count`,
+/// `batch_length`, `batch_checksum` and the routed header's `size` are
+/// restamped. Ids, timestamp deltas, payloads and user headers are copied
+/// verbatim.
+///
+/// Returns `Ok(None)` when `keep` rejects every message: an empty batch is
+/// never a valid request.
+///
+/// # Errors
+///
+/// [`IggyError::InvalidCommand`] when the request body is not a well-formed
+/// batch.
+pub fn retain_batch_messages(
+    message: Message<RoutedRequestHeader>,
+    mut keep: impl FnMut(usize) -> bool,
+) -> Result<Option<Message<RoutedRequestHeader>>, IggyError> {
+    let request_header = *message.header();
+    let total_size = request_header.size as usize;
+    let body = message
+        .as_slice()
+        .get(std::mem::size_of::<RoutedRequestHeader>()..total_size)
+        .ok_or(IggyError::InvalidCommand)?;
+    let batch = decode_batch_slice_with(body, BatchIntegrity::LayoutOnly)?;
+
+    let mut blob = BytesMut::with_capacity(batch.blob().len());
+    let mut kept: u32 = 0;
+    for (index, view) in batch.iter().enumerate() {
+        if !keep(index) {
+            continue;
+        }
+        let payload_length =
+            u32::try_from(view.payload.len()).map_err(|_| IggyError::InvalidCommand)?;
+        let user_headers_length =
+            u32::try_from(view.user_headers.len()).map_err(|_| IggyError::InvalidCommand)?;
+        let mut header = [0u8; BATCH_MESSAGE_HEADER_SIZE];
+        header[8..24].copy_from_slice(&view.header.id.to_le_bytes());
+        header[24..28].copy_from_slice(&kept.to_le_bytes());
+        header[28..32].copy_from_slice(&view.header.timestamp_delta.to_le_bytes());
+        header[32..36].copy_from_slice(&user_headers_length.to_le_bytes());
+        header[36..40].copy_from_slice(&payload_length.to_le_bytes());
+        let msg_start = blob.len();
+        blob.extend_from_slice(&header);
+        blob.extend_from_slice(view.payload);
+        blob.extend_from_slice(view.user_headers);
+        let checksum = XxHash3_64::oneshot(&blob[msg_start + 8..]);
+        blob[msg_start..msg_start + 8].copy_from_slice(&checksum.to_le_bytes());
+        kept = kept.checked_add(1).ok_or(IggyError::InvalidCommand)?;
+    }
+    if kept == 0 {
+        return Ok(None);
+    }
+
+    let blob = blob.freeze();
+    let mut header = batch.header;
+    header.message_count = kept;
+    header.batch_length =
+        u64::try_from(COMMAND_HEADER_SIZE + blob.len()).map_err(|_| IggyError::InvalidCommand)?;
+    header.batch_checksum = calculate_batch_checksum(&header, &blob);
+
+    SendMessagesOwned { header, blob }
+        .encode_request(request_header)
+        .map(Some)
+}
+
 /// Rebuild one stored batch record with every message's payload and user
 /// headers decrypted: the poll reply's single decrypt point, mirroring
 /// [`encrypt_batch_request`]. Lengths, per-message checksums, and the batch
@@ -1242,6 +1313,118 @@ mod tests {
             encrypted_body.as_slice(),
             "an already-canonical encrypted batch passes the partition convert untouched",
         );
+    }
+
+    fn numbered_messages(count: u64) -> IggyMessages {
+        let mut messages = IggyMessages::with_capacity(count as usize);
+        for index in 0..count {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    id: u128::from(100 + index),
+                    origin_timestamp: 1_000 + index,
+                    ..Default::default()
+                },
+                payload: Bytes::from(format!("payload-{index}")),
+                user_headers: (index % 2 == 1).then(|| Bytes::from(format!("headers-{index}"))),
+            });
+        }
+        messages
+    }
+
+    fn canonical_request(count: u64) -> Message<RoutedRequestHeader> {
+        let namespace = IggyNamespace::new(1, 1, 3);
+        let wire = wire_request_message(&wire_send_messages_body(&numbered_messages(count)));
+        convert_request_message(namespace, wire, ChecksumMode::Skip).expect("admission convert")
+    }
+
+    fn batch_body(message: &Message<RoutedRequestHeader>) -> Vec<u8> {
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        message.as_slice()[header_size..message.header().size as usize].to_vec()
+    }
+
+    #[test]
+    fn retain_batch_messages_renumbers_and_reseals_the_kept_messages() {
+        let request = canonical_request(5);
+        let original = batch_body(&request);
+        let original_views: Vec<(u128, u32, Vec<u8>, Vec<u8>)> =
+            decode_batch_slice_with(&original, BatchIntegrity::LayoutOnly)
+                .unwrap()
+                .iter()
+                .map(|view| {
+                    (
+                        view.header.id,
+                        view.header.timestamp_delta,
+                        view.payload.to_vec(),
+                        view.user_headers.to_vec(),
+                    )
+                })
+                .collect();
+
+        let kept_indexes = [0usize, 2, 3];
+        let retained = retain_batch_messages(request, |index| kept_indexes.contains(&index))
+            .unwrap()
+            .expect("three messages kept");
+        let body = batch_body(&retained);
+        // Full integrity check: per-message and batch checksums must verify,
+        // exactly as a backup and a disk reader will check them.
+        let batch = decode_batch_slice(&body).expect("retained batch verifies");
+        assert_eq!(batch.header.message_count, 3);
+        assert_eq!(body.len(), batch.header.total_size());
+        assert_eq!(
+            retained.header().size as usize,
+            std::mem::size_of::<RoutedRequestHeader>() + body.len()
+        );
+        for (position, view) in batch.iter().enumerate() {
+            let (id, timestamp_delta, payload, user_headers) =
+                &original_views[kept_indexes[position]];
+            assert_eq!(view.header.offset_delta, position as u32, "dense deltas");
+            assert_eq!(view.header.id, *id);
+            assert_eq!(view.header.timestamp_delta, *timestamp_delta);
+            assert_eq!(view.payload, payload.as_slice());
+            assert_eq!(view.user_headers, user_headers.as_slice());
+        }
+    }
+
+    #[test]
+    fn retain_batch_messages_keeping_everything_preserves_every_message() {
+        let request = canonical_request(4);
+        let original = batch_body(&request);
+        let retained = retain_batch_messages(request, |_| true).unwrap().unwrap();
+        let body = batch_body(&retained);
+        let before = decode_batch_slice_with(&original, BatchIntegrity::LayoutOnly).unwrap();
+        let after = decode_batch_slice(&body).unwrap();
+        assert_eq!(before.header.message_count, after.header.message_count);
+        for (left, right) in before.iter().zip(after.iter()) {
+            assert_eq!(left.header.id, right.header.id);
+            assert_eq!(left.payload, right.payload);
+            assert_eq!(left.user_headers, right.user_headers);
+        }
+    }
+
+    #[test]
+    fn retain_batch_messages_rejecting_everything_yields_no_request() {
+        assert!(
+            retain_batch_messages(canonical_request(3), |_| false)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn retained_batch_stamps_to_contiguous_offsets() {
+        // The retained request must survive the rest of the ingest path: once
+        // stamped at a base offset, its messages occupy exactly
+        // base..base + kept with no gap and no overlap.
+        let retained = retain_batch_messages(canonical_request(6), |index| index % 3 != 1)
+            .unwrap()
+            .unwrap();
+        let body = batch_body(&retained);
+        let batch = decode_batch_slice(&body).unwrap();
+        let offsets: Vec<u64> = batch
+            .iter()
+            .map(|view| 40 + u64::from(view.header.offset_delta))
+            .collect();
+        assert_eq!(offsets, vec![40, 41, 42, 43]);
     }
 
     /// Junk suffixes that must be refused at both ingest boundaries: one below a

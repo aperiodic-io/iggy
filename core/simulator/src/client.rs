@@ -601,6 +601,36 @@ impl SimClient {
         self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }
 
+    /// [`Self::send_messages`] with a user-header block per message, in the
+    /// TLV wire shape `iggy_binary_protocol::encode_user_headers` produces.
+    ///
+    /// # Panics
+    /// Panics if a group id exceeds `u32` or the request buffer is invalid.
+    pub fn send_messages_with_headers(
+        &self,
+        group: IggyNamespace,
+        messages: &[(Bytes, Option<Bytes>)],
+    ) -> Message<RoutedRequestHeader> {
+        let to_u32 = |v: usize| u32::try_from(v).expect("group id fits u32");
+        let stream_id = WireIdentifier::Numeric(to_u32(group.stream_id()));
+        let topic_id = WireIdentifier::Numeric(to_u32(group.topic_id()));
+        let partitioning = WirePartitioning::PartitionId(to_u32(group.partition_id()));
+        let raw: Vec<RawMessage<'_>> = messages
+            .iter()
+            .map(|(payload, headers)| RawMessage {
+                id: self.next_message_id(),
+                origin_timestamp: 0,
+                headers: headers.as_deref(),
+                payload: payload.as_ref(),
+            })
+            .collect();
+        let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &raw);
+        let mut buf = BytesMut::with_capacity(size);
+        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw)
+            .expect("simulator send batch encodes");
+        self.build_request_with_namespace(Operation::SendMessages, &buf, group)
+    }
+
     /// Build a `NonReplicated` request: `code` in the header's `reserved`
     /// prefix, `group` as the routing namespace, `body` already encoded.
     ///

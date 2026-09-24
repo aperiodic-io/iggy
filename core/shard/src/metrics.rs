@@ -244,6 +244,8 @@ pub struct ShardMetrics {
     partition_requests_denied_transient_total: Counter,
     partition_repair_serves_deferred_purge_total: Counter,
     partition_prepare_gap_drops_total: Counter,
+    partition_message_dedup_dropped_total: Counter,
+    partition_message_dedup_evicted_live_total: Counter,
     metadata_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
@@ -320,6 +322,8 @@ impl ShardMetrics {
             partition_requests_denied_transient_total: Counter::default(),
             partition_repair_serves_deferred_purge_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
+            partition_message_dedup_dropped_total: Counter::default(),
+            partition_message_dedup_evicted_live_total: Counter::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
@@ -362,6 +366,19 @@ impl ShardMetrics {
     pub fn record_replica_reads(&self, metrics: &ReplicaReadMetrics) {
         self.replica_socket_reads_total.inc_by(metrics.reads);
         self.replica_inbound_frames_total.inc_by(metrics.frames);
+    }
+
+    fn register_message_dedup(&self, registry: &mut Registry) {
+        registry.register(
+            "partition_message_dedup_dropped",
+            "messages removed from produce requests as duplicates of a key inside the topic's dedup_window",
+            self.partition_message_dedup_dropped_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_evicted_live",
+            "dedup keys evicted by [partition] message_dedup_entries_max while still inside their window; non-zero means the window is not fully enforced",
+            self.partition_message_dedup_evicted_live_total.clone(),
+        );
     }
 
     fn register_persistence(&self, registry: &mut Registry) {
@@ -711,6 +728,21 @@ impl ShardMetrics {
         self.partition_prepare_gap_drops_total.inc_by(drops);
     }
 
+    /// Add the message-dedup counters a partition accumulated since the last
+    /// drain. Shard-scoped like every partition counter here.
+    pub fn record_partition_message_dedup(&self, dropped: u64, evicted_live: u64) {
+        self.partition_message_dedup_dropped_total.inc_by(dropped);
+        self.partition_message_dedup_evicted_live_total
+            .inc_by(evicted_live);
+    }
+
+    /// Snapshot of `partition_message_dedup_dropped_total`. Test/simulator accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_message_dedup_dropped_value(&self) -> u64 {
+        self.partition_message_dedup_dropped_total.get()
+    }
+
     /// Snapshot of `partition_prepare_gap_drops_total`. Test/simulator accessor.
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
@@ -785,6 +817,7 @@ impl ShardMetrics {
     /// counters.
     pub fn register(&self, registry: &mut Registry) {
         self.register_persistence(registry);
+        self.register_message_dedup(registry);
         registry.register(
             "frame_drops",
             "frames shed instead of delivered, by frame class and refusal reason",
