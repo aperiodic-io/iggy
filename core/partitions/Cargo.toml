@@ -68,6 +68,7 @@ server_common = { workspace = true }
 smallvec = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+twox-hash = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
