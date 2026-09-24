@@ -26,6 +26,7 @@ mod iggy_partitions;
 pub mod install_backup;
 mod journal;
 mod log;
+pub mod message_dedup;
 mod messages_writer;
 mod offset_recovery;
 pub mod offset_storage;
