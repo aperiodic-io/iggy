@@ -95,6 +95,7 @@ primary, and runs the Go regression. It requires Go on `PATH`:
 ```bash
 cargo build --bin iggy-server --bin iggy
 cargo test -p integration given_split_primaries_when_go_group_auto_commits_should_preserve_membership -- --ignored
+cargo test -p integration given_split_primaries_when_go_group_commits_manually_should_preserve_membership -- --ignored
 ```
 
 To use an existing fixture, set its coordinator address and topic. The test
