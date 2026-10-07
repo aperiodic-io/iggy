@@ -9209,6 +9209,7 @@ where
             floor: None,
             peer,
             first_batch_offset: None,
+            first_batch_op: None,
             idle_ticks: 0,
         });
         tracing::info!(
@@ -9295,6 +9296,7 @@ where
             floor: None,
             peer,
             first_batch_offset: None,
+            first_batch_op: None,
             idle_ticks: 0,
         });
         tracing::info!(

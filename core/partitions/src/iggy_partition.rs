@@ -8789,12 +8789,12 @@ where
                     if header.op <= session.commit_to_op
                         && let (Some(base_offset), Some(session)) =
                             (base_offset, self.repair.as_mut())
+                        && session
+                            .first_batch_offset
+                            .is_none_or(|first| base_offset < first)
                     {
-                        session.first_batch_offset = Some(
-                            session
-                                .first_batch_offset
-                                .map_or(base_offset, |first| first.min(base_offset)),
-                        );
+                        session.first_batch_offset = Some(base_offset);
+                        session.first_batch_op = Some(header.op);
                     }
                     Ok(())
                 }
@@ -8923,7 +8923,23 @@ where
                 // Both are the state-transfer trigger; the session is
                 // dropped here so the caller's arming funnel starts clean,
                 // and a transfer-unavailable fallback re-arms repair fresh.
-                if committed_shape.complete {
+                //
+                // The window's START is final sooner, though: offsets rise with
+                // ops, so once every op between the floor and the first
+                // repaired batch is resident, nothing still to come can lower
+                // `first_batch_offset`. Waiting for the whole window instead
+                // wedged a window longer than one repair chunk whose floor had
+                // stopped moving: the next chunk is pulled only when the walk
+                // advances, which the refused floor never lets happen, so
+                // every stall retry re-fetched the same first chunk.
+                let leading_edge_resident = session.first_batch_op.is_some_and(|op| {
+                    self.log
+                        .journal()
+                        .inner
+                        .repaired_window_shape(floor, op.saturating_sub(1))
+                        .complete
+                });
+                if committed_shape.complete || leading_edge_resident {
                     self.repair = None;
                     return RepairConclusion::FloorRefused {
                         floor,
@@ -16558,6 +16574,7 @@ mod tests {
             floor: Some(floor),
             peer: 0,
             first_batch_offset,
+            first_batch_op: None,
             idle_ticks: 0,
         }
     }
@@ -17088,6 +17105,65 @@ mod tests {
              first batch offset into connection"
         );
         assert_eq!(partition.consensus().commit_min(), 0);
+        assert!(partition.repair.is_some());
+    }
+
+    /// The window's leading edge is resident and its first batch starts above
+    /// the durable end, but the rest of a window longer than one repair chunk
+    /// is missing. Offsets rise with ops, so no frame still to come can lower
+    /// the first batch offset: the refusal is final. Waiting for the whole
+    /// window instead wedged the replica for good once the serving peer
+    /// stopped evicting: the next chunk is pulled only when the commit walk
+    /// advances, which a refused floor never lets happen, so every stall retry
+    /// re-fetched the same first chunk and the window never completed.
+    #[compio::test]
+    async fn given_a_resident_leading_edge_above_durable_end_when_the_window_is_longer_than_a_chunk_should_refuse_commit_floor()
+     {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(10);
+        // The first served chunk: ops 6..=133, opening with a batch at offset
+        // 600. Ops 134..=300 never arrive.
+        journal_prepare(&partition, 6, Operation::SendMessages).await;
+        for op in 7..=133 {
+            journal_prepare(&partition, op, Operation::CreateStream).await;
+        }
+        let mut session = armed_session(300, 5, Some(600));
+        session.first_batch_op = Some(6);
+        partition.repair = Some(session);
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(
+            conclusion,
+            RepairConclusion::FloorRefused {
+                floor: 5,
+                to_op: 300
+            },
+            "a resident leading edge fixes where the window starts"
+        );
+        assert!(
+            partition.repair.is_none(),
+            "a definitive refusal hands recovery to state transfer"
+        );
+    }
+
+    /// The counterpart: an op below the first repaired batch is still missing,
+    /// so a frame for it may yet lower the first batch offset into connection.
+    #[compio::test]
+    async fn given_a_hole_below_the_first_batch_when_the_window_is_incomplete_should_keep_repairing()
+     {
+        let mut partition = test_partition();
+        partition.consensus().advance_commit_max(300);
+        partition.recovered_durable_offset = Some(10);
+        journal_prepare(&partition, 8, Operation::SendMessages).await;
+        let mut session = armed_session(300, 5, Some(600));
+        session.first_batch_op = Some(8);
+        partition.repair = Some(session);
+
+        let conclusion = partition.complete_repair(&repair_config()).await;
+
+        assert_eq!(conclusion, RepairConclusion::InProgress);
         assert!(partition.repair.is_some());
     }
 
