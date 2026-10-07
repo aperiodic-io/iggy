@@ -87,14 +87,33 @@ impl fmt::Debug for DedupHeaderName {
     }
 }
 
+/// `dedup_identity` value selecting the message ID as the identity.
+pub const DEDUP_IDENTITY_MESSAGE_ID: &str = "message_id";
+/// `dedup_identity` value selecting a user header as the identity.
+pub const DEDUP_IDENTITY_HEADER: &str = "header";
+
+/// What identifies a message for deduplication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupIdentity {
+    /// The message's own 128-bit ID. A message with ID 0 has no identity and
+    /// is admitted unindexed. Only meaningful for producers that set their
+    /// own IDs: the SDKs replace an unset ID with a random one.
+    MessageId,
+    /// The value of this user header. A message without it is refused, with
+    /// its whole request, rather than admitted unindexed: a producer that
+    /// stopped stamping the header would otherwise turn dedup off silently.
+    Header(DedupHeaderName),
+}
+
 /// A topic's resolved message-deduplication policy.
 ///
-/// Present only when the topic set a non-zero `dedup_window` and a
-/// `dedup_header`: a partition either dedups with both or not at all.
+/// Present only when the topic set a non-zero `dedup_window` and an identity
+/// (`dedup_header`, or `dedup_identity=message_id`): a partition either dedups
+/// with both or not at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageDedupPolicy {
     pub window: IggyDuration,
-    pub header: DedupHeaderName,
+    pub identity: DedupIdentity,
 }
 
 impl MessageDedupPolicy {
