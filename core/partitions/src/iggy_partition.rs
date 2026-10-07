@@ -23,8 +23,8 @@ use crate::journal::{MessageLookup, PartitionJournal, PartitionJournalMemStorage
 use crate::log::JournalInfo;
 use crate::log::SegmentedLog;
 use crate::message_dedup::{
-    DEFAULT_MESSAGE_DEDUP_ENTRIES_MAX, DedupCounters, DedupKey, MessageDedupIndex, REBUILT_OP,
-    classify_batch, record_committed_batch, record_pending_batch,
+    DEFAULT_MESSAGE_DEDUP_ENTRIES_MAX, DedupCounters, DedupKey, MessageDedupIndex, classify_batch,
+    record_committed_batch, record_pending_batch,
 };
 use crate::messages_writer::MessagesWriter;
 use crate::offset_storage::{
@@ -835,6 +835,12 @@ where
         self.message_dedup.borrow().len()
     }
 
+    /// Bytes the content-dedup index's tables hold allocated.
+    #[must_use]
+    pub fn message_dedup_allocated_bytes(&self) -> usize {
+        self.message_dedup.borrow().allocated_bytes()
+    }
+
     /// Order-independent digest of the committed half of the content-dedup
     /// index. Replicas at the same commit hold the same one.
     #[must_use]
@@ -842,10 +848,10 @@ where
         self.message_dedup.borrow().fingerprint()
     }
 
-    /// The content-dedup index as `(key, offset, timestamp, op)`, sorted.
+    /// The content-dedup index as `(key, offset, timestamp)`, sorted.
     /// Diagnostics only.
     #[must_use]
-    pub fn message_dedup_entries(&self) -> Vec<(u128, u64, u64, u64)> {
+    pub fn message_dedup_entries(&self) -> Vec<(u128, u64, u64)> {
         self.message_dedup.borrow().entries_sorted()
     }
 
@@ -870,7 +876,10 @@ where
                 kept_keys: None,
             };
         };
-        let now = self.consensus.clock_realtime_micros();
+        // The timestamp this request's own prepare would get: entries carry
+        // prepare timestamps, so the window compares like with like even when
+        // this node's clock lags the primary that appended them.
+        let now = self.consensus.peek_monotonic_timestamp();
         let verdict = {
             let total_size = message.header().size as usize;
             let Some(body) = message
@@ -898,11 +907,24 @@ where
                 self.consensus.commit_min(),
             )
         };
+        if verdict.missing_identity {
+            self.message_dedup.borrow_mut().note_missing_identity();
+            return DedupScreen::Refused {
+                header: *message.header(),
+                error: IggyError::MessageDedupIdentityMissing,
+            };
+        }
         if verdict.matched_uncommitted {
             self.message_dedup.borrow_mut().note_deferred();
-            return DedupScreen::Deferred {
+            return DedupScreen::Refused {
                 header: *message.header(),
+                error: IggyError::TransientNotCommitted,
             };
+        }
+        if verdict.unindexed > 0 {
+            self.message_dedup
+                .borrow_mut()
+                .note_unindexed(verdict.unindexed);
         }
         if verdict.keeps_all() {
             return DedupScreen::Proceed {
@@ -926,8 +948,9 @@ where
             },
             // Unreachable: keeps_none() was ruled out and the batch decoded.
             // Refusing transiently is the answer that can never lose data.
-            Ok(None) | Err(_) => DedupScreen::Deferred {
+            Ok(None) | Err(_) => DedupScreen::Refused {
                 header: RoutedRequestHeader::default(),
+                error: IggyError::TransientNotCommitted,
             },
         }
     }
@@ -960,21 +983,22 @@ where
     }
 
     /// Answer a request the dedup screen resolved without replicating it:
-    /// every message a committed duplicate (success), or some message
-    /// matching an uncommitted occurrence (retry, since whether it is a
-    /// duplicate depends on whether that occurrence commits).
+    /// every message a committed duplicate (`refusal` `None`, success), some
+    /// message matching an uncommitted occurrence (`TransientNotCommitted`:
+    /// retry, since whether it is a duplicate depends on whether that
+    /// occurrence commits), or some message without the topic's header.
     async fn answer_dedup_screen(
         consensus: &VsrConsensus<B>,
         header: &RoutedRequestHeader,
-        deferred: bool,
+        refusal: Option<IggyError>,
         waiter: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
-        if deferred {
+        if let Some(error) = refusal {
             Self::send_partition_deny_or_log(
                 consensus,
                 header,
-                IggyError::TransientNotCommitted.as_code(),
-                "dedup deferred reply send failed",
+                error.as_code(),
+                "dedup refusal reply send failed",
                 waiter,
             )
             .await;
@@ -1063,25 +1087,31 @@ where
         let window = policy.window_micros();
         let from = self
             .consensus
-            .clock_realtime_micros()
+            .peek_monotonic_timestamp()
             .saturating_sub(window)
             .saturating_sub(REBUILD_CLOCK_MARGIN_MICROS);
+        // Fold straight into the index as the walk reads, rather than buffering
+        // every key first: a busy window is millions of keys. The index is
+        // taken out for the walk, which needs `self`; nothing else touches it
+        // meanwhile (boot and state-transfer install hold the partition).
+        let mut index = std::mem::replace(
+            self.message_dedup.get_mut(),
+            MessageDedupIndex::new(DEFAULT_MESSAGE_DEDUP_ENTRIES_MAX),
+        );
         let mut folded = 0u64;
-        let mut keyed = Vec::new();
         self.walk_committed_messages(
             PollingStrategy::timestamp(IggyTimestamp::from(from)),
-            |offset, timestamp, user_headers| {
+            |offset, timestamp, id, user_headers| {
                 folded += 1;
-                if let Some(key) = crate::message_dedup::dedup_key(user_headers, &policy.header) {
-                    keyed.push((key, offset, timestamp));
+                if let crate::message_dedup::MessageIdentity::Key(key) =
+                    crate::message_dedup::message_identity(&policy.identity, id, user_headers)
+                {
+                    index.record_committed(key, offset, timestamp, window);
                 }
             },
         )
         .await;
-        let index = self.message_dedup.get_mut();
-        for (key, offset, timestamp) in keyed {
-            index.record_committed(key, offset, timestamp, REBUILT_OP, window);
-        }
+        *self.message_dedup.get_mut() = index;
         // The resident journal can hold ops past the commit frontier that no
         // append on this incarnation folded: a restart that kept its journal,
         // or an install whose repaired tail is already resident. They may
@@ -1123,7 +1153,7 @@ where
     async fn walk_committed_messages(
         &mut self,
         start: PollingStrategy,
-        mut visit: impl FnMut(u64, u64, &[u8]),
+        mut visit: impl FnMut(u64, u64, u128, &[u8]),
     ) {
         const WALK_POLL_COUNT: u32 = 4096;
         let mut strategy = start;
@@ -1143,7 +1173,12 @@ where
                     for view in &batch {
                         let offset = batch.header.base_offset + u64::from(view.header.offset_delta);
                         last_offset = Some(last_offset.map_or(offset, |last| last.max(offset)));
-                        visit(offset, batch.header.base_timestamp, view.user_headers);
+                        visit(
+                            offset,
+                            batch.header.base_timestamp,
+                            view.header.id,
+                            view.user_headers,
+                        );
                     }
                     let Some(rest) = record.get(size..) else {
                         break;
@@ -1171,7 +1206,7 @@ where
     #[cfg(any(test, feature = "fault-injection"))]
     pub async fn committed_message_timestamps(&mut self) -> Vec<(u64, u64)> {
         let mut messages = Vec::new();
-        self.walk_committed_messages(PollingStrategy::offset(0), |offset, timestamp, _| {
+        self.walk_committed_messages(PollingStrategy::offset(0), |offset, timestamp, _, _| {
             messages.push((offset, timestamp));
         })
         .await;
@@ -1185,8 +1220,22 @@ where
     #[cfg(any(test, feature = "fault-injection"))]
     pub async fn committed_message_headers(&mut self) -> Vec<(u64, Vec<u8>)> {
         let mut messages = Vec::new();
-        self.walk_committed_messages(PollingStrategy::offset(0), |offset, _, user_headers| {
+        self.walk_committed_messages(PollingStrategy::offset(0), |offset, _, _, user_headers| {
             messages.push((offset, user_headers.to_vec()));
+        })
+        .await;
+        messages.sort_unstable_by_key(|(offset, _)| *offset);
+        messages.dedup_by_key(|(offset, _)| *offset);
+        messages
+    }
+
+    /// Every committed message as `(offset, message ID)`, oldest first.
+    /// Test and simulator accessor.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn committed_message_ids(&mut self) -> Vec<(u64, u128)> {
+        let mut messages = Vec::new();
+        self.walk_committed_messages(PollingStrategy::offset(0), |offset, _, id, _| {
+            messages.push((offset, id));
         })
         .await;
         messages.sort_unstable_by_key(|(offset, _)| *offset);
@@ -5031,11 +5080,12 @@ where
                 let (message, dedup_keys) = match self.screen_duplicate_messages(message) {
                     DedupScreen::Proceed { message, kept_keys } => (message, kept_keys),
                     DedupScreen::AllDuplicates { header } => {
-                        Self::answer_dedup_screen(consensus, &header, false, reply.take()).await;
+                        Self::answer_dedup_screen(consensus, &header, None, reply.take()).await;
                         return;
                     }
-                    DedupScreen::Deferred { header } => {
-                        Self::answer_dedup_screen(consensus, &header, true, reply.take()).await;
+                    DedupScreen::Refused { header, error } => {
+                        Self::answer_dedup_screen(consensus, &header, Some(error), reply.take())
+                            .await;
                         return;
                     }
                 };
@@ -5227,22 +5277,22 @@ where
             let (message, dedup_keys) = match self.screen_duplicate_messages(req.message) {
                 DedupScreen::Proceed { message, kept_keys } => (message, kept_keys),
                 DedupScreen::AllDuplicates { header } => {
-                    Self::answer_dedup_screen(
-                        self.consensus(),
-                        &header,
-                        false,
-                        reply_sender.take(),
-                    )
-                    .await;
+                    Self::answer_dedup_screen(self.consensus(), &header, None, reply_sender.take())
+                        .await;
                     consecutive_denials += 1;
                     if consecutive_denials >= PROMOTION_DENIALS_MAX {
                         break;
                     }
                     continue;
                 }
-                DedupScreen::Deferred { header } => {
-                    Self::answer_dedup_screen(self.consensus(), &header, true, reply_sender.take())
-                        .await;
+                DedupScreen::Refused { header, error } => {
+                    Self::answer_dedup_screen(
+                        self.consensus(),
+                        &header,
+                        Some(error),
+                        reply_sender.take(),
+                    )
+                    .await;
                     consecutive_denials += 1;
                     if consecutive_denials >= PROMOTION_DENIALS_MAX {
                         break;
@@ -9257,8 +9307,12 @@ enum DedupScreen {
     /// Every message was a committed duplicate: answer success without
     /// replicating anything.
     AllDuplicates { header: RoutedRequestHeader },
-    /// Some message matched an uncommitted occurrence: refuse transiently.
-    Deferred { header: RoutedRequestHeader },
+    /// Refuse the whole request: transiently when some message matched an
+    /// uncommitted occurrence, for good when one lacked the topic's header.
+    Refused {
+        header: RoutedRequestHeader,
+        error: IggyError,
+    },
 }
 
 const fn committed_reply_body(operation: Operation) -> bytes::Bytes {

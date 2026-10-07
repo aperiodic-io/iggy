@@ -2257,6 +2257,15 @@ impl<B: MessageBus, P: Pipeline<Entry = PipelineEntry>> VsrConsensus<B, P> {
         next
     }
 
+    /// The timestamp [`Self::next_monotonic_timestamp`] would return now,
+    /// without consuming it. Admission checks that must judge a request in the
+    /// time its prepare will carry (message dedup's window) read this.
+    #[must_use]
+    pub fn peek_monotonic_timestamp(&self) -> u64 {
+        let now = self.clock.realtime().as_micros();
+        now.max(self.last_timestamp.get().saturating_add(1))
+    }
+
     /// Read-only clock read (microseconds since the Unix epoch). Unlike
     /// [`Self::next_monotonic_timestamp`] it does not advance the floor:
     /// snapshots stamp `created_at` from the same seed-derived clock so a
@@ -4862,6 +4871,32 @@ mod timestamp_clamp_tests {
         // Observing an OLDER timestamp never rewinds the floor.
         consensus.observe_prepare_timestamp(10);
         assert!(consensus.next_monotonic_timestamp() > second);
+    }
+
+    #[test]
+    fn peek_reads_the_next_prepare_stamp_without_consuming_it() {
+        // Message dedup screens a request in the time its prepare will carry.
+        // A lagging clock must not make every entry the log stamped look
+        // younger than it is, and screening must not advance the floor.
+        let lagging_clock = ConsensusClock::new(Rc::new(FixedClock(1_000)));
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            1,
+            METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+            lagging_clock,
+        );
+        consensus.observe_prepare_timestamp(50_000);
+        let peeked = consensus.peek_monotonic_timestamp();
+        assert_eq!(
+            peeked,
+            consensus.peek_monotonic_timestamp(),
+            "peek consumed"
+        );
+        assert_eq!(peeked, consensus.next_monotonic_timestamp());
+        assert!(consensus.peek_monotonic_timestamp() > peeked);
     }
 
     #[test]

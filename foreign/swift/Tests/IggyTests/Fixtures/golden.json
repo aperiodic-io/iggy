@@ -832,6 +832,7 @@
     "4041": "unsupported_option_key",
     "4042": "invalid_option_value",
     "4043": "options_block_too_large",
+    "4044": "message_dedup_identity_missing",
     "4050": "cannot_send_messages_due_to_client_disconnection",
     "4051": "background_send_error",
     "4052": "background_send_timeout",

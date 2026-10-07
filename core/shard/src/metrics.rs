@@ -71,6 +71,29 @@ pub struct ConsumerOffsetKindLabel {
     pub kind: &'static str,
 }
 
+/// One deduplicating partition. Only partitions whose topic deduplicates get
+/// a series, so cardinality is bounded by the dedup topics' partition count.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct DedupPartitionLabel {
+    pub stream_id: u64,
+    pub topic_id: u64,
+    pub partition_id: u64,
+}
+
+/// One drain of a partition's message-dedup state, see
+/// [`ShardMetrics::record_partition_message_dedup`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MessageDedupSample {
+    pub dropped: u64,
+    pub deferred: u64,
+    pub missing_identity: u64,
+    pub unindexed: u64,
+    pub evicted_live: u64,
+    pub unconfirmed_commits: u64,
+    pub entries: u64,
+    pub allocated_bytes: u64,
+}
+
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
 /// catch typos at compile time and to keep the cardinality bounded.
 ///
@@ -239,6 +262,13 @@ pub struct ShardMetrics {
     partition_prepare_gap_drops_total: Counter,
     partition_message_dedup_dropped_total: Counter,
     partition_message_dedup_evicted_live_total: Counter,
+    partition_message_dedup_deferred_total: Counter,
+    partition_message_dedup_missing_identity_total: Counter,
+    partition_message_dedup_unindexed_total: Counter,
+    partition_message_dedup_unconfirmed_commits_total: Counter,
+    partition_message_dedup_entries: Family<DedupPartitionLabel, Gauge>,
+    partition_message_dedup_allocated_bytes: Family<DedupPartitionLabel, Gauge>,
+    partition_message_dedup_evicted_live_by_partition: Family<DedupPartitionLabel, Counter>,
     metadata_prepare_gap_drops_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
@@ -309,6 +339,13 @@ impl ShardMetrics {
             partition_prepare_gap_drops_total: Counter::default(),
             partition_message_dedup_dropped_total: Counter::default(),
             partition_message_dedup_evicted_live_total: Counter::default(),
+            partition_message_dedup_deferred_total: Counter::default(),
+            partition_message_dedup_missing_identity_total: Counter::default(),
+            partition_message_dedup_unindexed_total: Counter::default(),
+            partition_message_dedup_unconfirmed_commits_total: Counter::default(),
+            partition_message_dedup_entries: Family::default(),
+            partition_message_dedup_allocated_bytes: Family::default(),
+            partition_message_dedup_evicted_live_by_partition: Family::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
@@ -363,6 +400,41 @@ impl ShardMetrics {
             "partition_message_dedup_evicted_live",
             "dedup keys evicted by [partition] message_dedup_entries_max while still inside their window; non-zero means the window is not fully enforced",
             self.partition_message_dedup_evicted_live_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_evicted_live_by_partition",
+            "partition_message_dedup_evicted_live per deduplicating partition: which partition outgrew the cap",
+            self.partition_message_dedup_evicted_live_by_partition.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_deferred",
+            "produce requests refused transiently (TransientNotCommitted) because a message matched a not yet committed occurrence; the client retries",
+            self.partition_message_dedup_deferred_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_missing_identity",
+            "produce requests refused because a message lacked the topic's dedup_header",
+            self.partition_message_dedup_missing_identity_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_unindexed",
+            "messages admitted without a dedup identity (dedup_identity=message_id, message ID 0)",
+            self.partition_message_dedup_unindexed_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_unconfirmed_commits",
+            "committed ops whose batch could not be read back at commit, so their keys were not indexed",
+            self.partition_message_dedup_unconfirmed_commits_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_entries",
+            "committed keys in a deduplicating partition's index; at message_dedup_entries_max the oldest are evicted",
+            self.partition_message_dedup_entries.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_allocated_bytes",
+            "heap bytes a deduplicating partition's index tables hold allocated",
+            self.partition_message_dedup_allocated_bytes.clone(),
         );
     }
 
@@ -714,11 +786,48 @@ impl ShardMetrics {
     }
 
     /// Add the message-dedup counters a partition accumulated since the last
-    /// drain. Shard-scoped like every partition counter here.
-    pub fn record_partition_message_dedup(&self, dropped: u64, evicted_live: u64) {
-        self.partition_message_dedup_dropped_total.inc_by(dropped);
+    /// drain to the shard's totals, and set its per-partition series. Called
+    /// only for deduplicating partitions.
+    pub fn record_partition_message_dedup(
+        &self,
+        partition: &DedupPartitionLabel,
+        sample: &MessageDedupSample,
+    ) {
+        self.partition_message_dedup_dropped_total
+            .inc_by(sample.dropped);
         self.partition_message_dedup_evicted_live_total
-            .inc_by(evicted_live);
+            .inc_by(sample.evicted_live);
+        self.partition_message_dedup_deferred_total
+            .inc_by(sample.deferred);
+        self.partition_message_dedup_missing_identity_total
+            .inc_by(sample.missing_identity);
+        self.partition_message_dedup_unindexed_total
+            .inc_by(sample.unindexed);
+        self.partition_message_dedup_unconfirmed_commits_total
+            .inc_by(sample.unconfirmed_commits);
+        if sample.evicted_live > 0 {
+            self.partition_message_dedup_evicted_live_by_partition
+                .get_or_create(partition)
+                .inc_by(sample.evicted_live);
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            self.partition_message_dedup_entries
+                .get_or_create(partition)
+                .set(sample.entries as i64);
+            self.partition_message_dedup_allocated_bytes
+                .get_or_create(partition)
+                .set(sample.allocated_bytes as i64);
+        }
+    }
+
+    /// Drop a removed partition's per-partition dedup series.
+    pub fn forget_partition_message_dedup(&self, partition: &DedupPartitionLabel) {
+        self.partition_message_dedup_entries.remove(partition);
+        self.partition_message_dedup_allocated_bytes
+            .remove(partition);
+        self.partition_message_dedup_evicted_live_by_partition
+            .remove(partition);
     }
 
     /// Snapshot of `partition_message_dedup_dropped_total`. Test/simulator accessor.

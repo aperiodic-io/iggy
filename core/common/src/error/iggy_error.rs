@@ -434,6 +434,10 @@ pub enum IggyError {
     InvalidOptionValue(String) = 4042,
     #[error("Options block exceeds its limits: {0}")]
     OptionsBlockTooLarge(String) = 4043,
+    /// A message lacks the user header its topic deduplicates on. The whole
+    /// request is refused: admitting it would leave that event undeduplicated.
+    #[error("Message lacks the topic's dedup_header")]
+    MessageDedupIdentityMissing = 4044,
     #[error("Cannot sed messages due to client disconnection")]
     CannotSendMessagesDueToClientDisconnection = 4050,
     #[error("Background send error")]

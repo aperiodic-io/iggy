@@ -1029,6 +1029,10 @@
   fields:
     - name: Details
       type: string
+- name: MessageDedupIdentityMissing
+  code: 4044
+  format: "message lacks the topic's dedup_header"
+  fields: []
 - name: CannotSendMessagesDueToClientDisconnection
   code: 4050
   format: "cannot sed messages due to client disconnection"
