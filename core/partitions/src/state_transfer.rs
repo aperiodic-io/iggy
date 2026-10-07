@@ -2752,18 +2752,31 @@ where
             });
         }
         // The install rewinds the sequencer to `commit_op`, which erases ops
-        // this replica may already have journaled and acked. Bounding it below
-        // by what this replica knows to be COMMITTED keeps the erased window to
-        // ops it does not know are committed -- the checkable form of an
-        // argument the rewind's own comment only asserts. Free on an honest
-        // offer: only a caught-up primary can serve, so its `commit_min`
-        // equals its `commit_max`, and the receiver's descriptor gate already
-        // refused any peer whose `commit_max` was below this one's.
-        let commit_max = self.consensus().commit_max();
-        if commit_op < commit_max {
+        // this replica may already have journaled and acked: the window
+        // `(commit_op, sequencer]`. Every op this replica acked sits in it,
+        // since a backup acks only an op it journaled at `sequencer + 1` or an
+        // adopted suffix op at or below the adopted head. Refusing when that
+        // window holds an op this replica knows is COMMITTED keeps the erased
+        // window to ops it does not know are committed -- the checkable form
+        // of an argument the rewind's own comment only asserts.
+        //
+        // Bounded by the sequencer, not by `commit_max` alone. A transfer pull
+        // takes seconds, the receiver withholds acks and drops prepares while
+        // it runs, and the primary's heartbeats keep raising its `commit_max`.
+        // Under sustained produce load every offer was therefore below it by
+        // the time it landed, the install was refused, and the next round was
+        // just as far behind: the replica never caught up and kept serving its
+        // stale prefix. A gap-stopped journal at or below `commit_op` erases
+        // nothing, and the committed tail above the offer is left to journal
+        // repair like the rest of `(commit_op, commit_max]`.
+        let erased_committed_through = self
+            .consensus()
+            .commit_max()
+            .min(self.consensus().sequencer().current_sequence());
+        if commit_op < erased_committed_through {
             return Err(PartitionInstallError::StaleTransfer {
                 commit_op,
-                commit_min: commit_max,
+                commit_min: erased_committed_through,
             });
         }
         let offsets_wire = ConsumerOffsetsWire::decode(offsets_bytes)?;

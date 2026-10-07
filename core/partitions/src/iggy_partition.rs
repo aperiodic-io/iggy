@@ -9733,6 +9733,128 @@ mod tests {
         );
     }
 
+    /// A replica that needs state transfer under sustained produce load: the
+    /// serving primary builds its offer at its `commit_min`, and by the time the
+    /// pull lands (seconds for a GiB-sized active segment) the cluster has
+    /// committed past it and the receiver has learned that from heartbeats. Its
+    /// gap-stopped journal holds no op above the offer, so the install erases
+    /// nothing and the committed tail above the offer is left to journal
+    /// repair. Refusing it because `commit_max` moved is a livelock: every
+    /// offer is behind by the time it lands, so the replica never catches up
+    /// and keeps serving reads from its stale prefix.
+    #[compio::test]
+    async fn given_commit_max_advanced_during_the_pull_when_installing_should_land_and_leave_the_tail_to_repair()
+     {
+        let (origin_directory, receiver_directory) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (offer, committed) = single_op_transfer_offer(origin_directory.path()).await;
+        let (mut receiver, _) = recording_partition_at(1, 3);
+        receiver.set_partition_dir(receiver_directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut receiver, receiver_directory.path());
+        // Learned from the primary's commit heartbeats while the pull ran; the
+        // journal itself never got past the gap, so the sequencer is below the
+        // offer.
+        receiver.consensus().advance_commit_max(4);
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), 0);
+
+        receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+                0,
+            )
+            .await
+            .expect("an offer that erases no journaled op must install");
+
+        assert_eq!(receiver.consensus().commit_min(), 1);
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), 1);
+        assert_eq!(
+            receiver.consensus().commit_max(),
+            4,
+            "the committed tail above the offer stays known, for journal repair to fetch"
+        );
+        assert_eq!(
+            receiver.consensus().last_prepare_checksum(),
+            committed.header().checksum
+        );
+    }
+
+    /// The other side of the same guard: an install rewinds the sequencer to
+    /// the offer's `commit_op` and clears the journal, so ops this replica
+    /// journaled (and may have acked) above the offer are erased. When any of
+    /// them is known committed, erasing it could drop a copy a commit quorum
+    /// counted, so the install must refuse.
+    #[compio::test]
+    async fn given_journaled_committed_ops_above_the_offer_when_installing_should_refuse() {
+        let (origin_directory, receiver_directory) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (offer, _) = single_op_transfer_offer(origin_directory.path()).await;
+        let (mut receiver, _) = recording_partition_at(1, 3);
+        receiver.set_partition_dir(receiver_directory.path().to_string_lossy().into_owned());
+        set_offset_dirs_under(&mut receiver, receiver_directory.path());
+        receiver.consensus().sequencer().set_sequence(3);
+        receiver.consensus().advance_commit_max(4);
+
+        let refused = receiver
+            .install_state_transfer(
+                &repair_config(),
+                offer.commit_op,
+                Vec::new(),
+                &offer.offsets.1,
+                0,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                refused,
+                Err(
+                    crate::state_transfer::PartitionInstallError::StaleTransfer {
+                        commit_op: 1,
+                        ..
+                    }
+                )
+            ),
+            "expected a stale-transfer refusal, got {refused:?}"
+        );
+        assert_eq!(receiver.consensus().sequencer().current_sequence(), 3);
+        assert_eq!(receiver.consensus().commit_min(), 0);
+    }
+
+    /// A caught-up primary's offer at `commit_op = 1` (one committed prepare,
+    /// evicted to the repair ring, segments retained away), and that prepare.
+    async fn single_op_transfer_offer(
+        directory: &std::path::Path,
+    ) -> (
+        Rc<crate::state_transfer::PartitionStateTransferOffer>,
+        Message<PrepareHeader>,
+    ) {
+        let (mut origin, _) = recording_partition_at(0, 3);
+        origin.set_partition_dir(directory.to_string_lossy().into_owned());
+        let committed = checksummed_segment_prepare(1, 0, 0, b"committed");
+        origin
+            .log
+            .journal()
+            .inner
+            .append(committed.clone().into_frozen())
+            .await
+            .unwrap();
+        origin.consensus().sequencer().set_sequence(1);
+        origin
+            .consensus()
+            .set_last_prepare_checksum(committed.header().checksum);
+        origin.consensus().advance_commit_max(1);
+        origin.consensus().advance_commit_min(1);
+        origin.offset_space.committed_seeded = true;
+        origin.offset.store(0, Ordering::Relaxed);
+        origin.log.journal().inner.evict_prefix(1).await;
+        let offer = origin.state_transfer_offer(&repair_config()).await.unwrap();
+        assert_eq!(offer.commit_op, 1);
+        (offer, committed)
+    }
+
     #[compio::test]
     async fn transfer_establishes_wal_body_ownership_without_losing_the_active_index_writer() {
         for durability in [
