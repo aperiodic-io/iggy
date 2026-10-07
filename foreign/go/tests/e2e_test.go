@@ -303,10 +303,13 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 		assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress,
 			"the commit must not move the coordinator session")
 	}
-	stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
-	require.NoError(t, err)
-	require.NotNil(t, stored)
-	assert.Equal(t, uint64(1), stored.StoredOffset)
+	// GetConsumerOffset reads the coordinator's replica, which trails the
+	// primary that took the commit (see the README), so it converges rather
+	// than reads back at once.
+	require.Eventually(t, func() bool {
+		stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
+		return err == nil && stored != nil && stored.StoredOffset == 1
+	}, 5*time.Second, 50*time.Millisecond, "the manual commit must replicate to the coordinator's backup")
 	afterClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, beforeClient.ID, afterClient.ID, "the commit registered a new client identity")
