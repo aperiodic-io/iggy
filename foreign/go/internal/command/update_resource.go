@@ -71,6 +71,7 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.TopicOptionPreallocateSegments), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: string(iggcon.TopicOptionDedupWindow), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: string(iggcon.TopicOptionDedupHeader), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
+	{key: string(iggcon.TopicOptionDedupIdentity), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: string(iggcon.StreamOptionEncryptionKey), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}},
 	{key: "encryption_key_wrapped", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: string(iggcon.StreamOptionEncryptionKeySource), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},

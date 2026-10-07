@@ -488,6 +488,7 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.TopicOptionPreallocateSegments),
 			string(iggcon.TopicOptionDedupWindow),
 			string(iggcon.TopicOptionDedupHeader),
+			string(iggcon.TopicOptionDedupIdentity),
 		},
 		"user": {
 			string(iggcon.UserOptionUsername),
@@ -565,6 +566,7 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"preallocate_segments":              {create: "PreallocateSegments"},
 			"dedup_window":                      {create: "DedupWindow"},
 			"dedup_header":                      {create: "DedupHeader"},
+			"dedup_identity":                    {create: "DedupIdentity"},
 		},
 		"user": {
 			"username": {update: "Username"},

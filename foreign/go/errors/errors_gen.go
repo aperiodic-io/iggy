@@ -2167,6 +2167,15 @@ func (e OptionsBlockTooLarge) Is(target error) bool {
 	return ok
 }
 
+type MessageDedupIdentityMissing struct{}
+
+func (e MessageDedupIdentityMissing) Error() string { return "message lacks the topic's dedup_header" }
+func (e MessageDedupIdentityMissing) Code() Code    { return 4044 }
+func (e MessageDedupIdentityMissing) Is(target error) bool {
+	_, ok := target.(MessageDedupIdentityMissing)
+	return ok
+}
+
 type CannotSendMessagesDueToClientDisconnection struct{}
 
 func (e CannotSendMessagesDueToClientDisconnection) Error() string {
@@ -3065,6 +3074,7 @@ var (
 	ErrUnsupportedOptionKey                       = UnsupportedOptionKey{}
 	ErrInvalidOptionValue                         = InvalidOptionValue{}
 	ErrOptionsBlockTooLarge                       = OptionsBlockTooLarge{}
+	ErrMessageDedupIdentityMissing                = MessageDedupIdentityMissing{}
 	ErrCannotSendMessagesDueToClientDisconnection = CannotSendMessagesDueToClientDisconnection{}
 	ErrBackgroundSendError                        = BackgroundSendError{}
 	ErrBackgroundSendTimeout                      = BackgroundSendTimeout{}
@@ -3328,6 +3338,7 @@ const (
 	UnsupportedOptionKeyCode                       Code = 4041
 	InvalidOptionValueCode                         Code = 4042
 	OptionsBlockTooLargeCode                       Code = 4043
+	MessageDedupIdentityMissingCode                Code = 4044
 	CannotSendMessagesDueToClientDisconnectionCode Code = 4050
 	BackgroundSendErrorCode                        Code = 4051
 	BackgroundSendTimeoutCode                      Code = 4052
@@ -3783,6 +3794,8 @@ func (c Code) String() string {
 		return "InvalidOptionValue"
 	case OptionsBlockTooLargeCode:
 		return "OptionsBlockTooLarge"
+	case MessageDedupIdentityMissingCode:
+		return "MessageDedupIdentityMissing"
 	case CannotSendMessagesDueToClientDisconnectionCode:
 		return "CannotSendMessagesDueToClientDisconnection"
 	case BackgroundSendErrorCode:
@@ -4306,6 +4319,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidOptionValue
 	case OptionsBlockTooLargeCode:
 		return ErrOptionsBlockTooLarge
+	case MessageDedupIdentityMissingCode:
+		return ErrMessageDedupIdentityMissing
 	case CannotSendMessagesDueToClientDisconnectionCode:
 		return ErrCannotSendMessagesDueToClientDisconnection
 	case BackgroundSendErrorCode:

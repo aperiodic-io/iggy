@@ -2909,6 +2909,8 @@ where
                     // races (the partition is gone, so the frames are moot).
                     self.discard_parked_partition_frames(namespace);
                     self.metrics.record_partition_removed();
+                    self.metrics
+                        .forget_partition_message_dedup(&dedup_partition_label(namespace));
                     confirmed_remove = true;
                     if let Some(partition) = removed {
                         // Tail of the gap-drop count. The tick sweep drains it
@@ -8377,10 +8379,21 @@ where
                 self.metrics
                     .record_partition_applied_log_contradictions(contradictions);
             }
-            let dedup = partition.take_message_dedup_counters();
-            if dedup.dropped > 0 || dedup.evicted_live > 0 {
-                self.metrics
-                    .record_partition_message_dedup(dedup.dropped, dedup.evicted_live);
+            if partition.message_dedup_policy().is_some() {
+                let dedup = partition.take_message_dedup_counters();
+                self.metrics.record_partition_message_dedup(
+                    &dedup_partition_label(namespace),
+                    &metrics::MessageDedupSample {
+                        dropped: dedup.dropped,
+                        deferred: dedup.deferred,
+                        missing_identity: dedup.missing_identity,
+                        unindexed: dedup.unindexed,
+                        evicted_live: dedup.evicted_live,
+                        unconfirmed_commits: dedup.unconfirmed_commits,
+                        entries: partition.message_dedup_len() as u64,
+                        allocated_bytes: partition.message_dedup_allocated_bytes() as u64,
+                    },
+                );
             }
             // A fenced partition must not tick: its consensus would emit
             // view-scoped sends for a log the cluster has already passed.
@@ -17096,5 +17109,14 @@ mod untrusted_do_view_change_tests {
                 group: GROUP,
             }
         ));
+    }
+}
+
+/// The per-partition dedup metric labels of `namespace`.
+fn dedup_partition_label(namespace: IggyNamespace) -> metrics::DedupPartitionLabel {
+    metrics::DedupPartitionLabel {
+        stream_id: namespace.stream_id() as u64,
+        topic_id: namespace.topic_id() as u64,
+        partition_id: namespace.partition_id() as u64,
     }
 }

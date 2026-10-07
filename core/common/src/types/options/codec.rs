@@ -17,8 +17,9 @@
 
 use super::key::OptionKey;
 use super::{
-    DedupHeaderName, Durability, MAX_DEDUP_WINDOW_MICROS, MAX_MESSAGES_REQUIRED_TO_SAVE,
-    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, PartitionResizePolicy,
+    DEDUP_IDENTITY_HEADER, DEDUP_IDENTITY_MESSAGE_ID, DedupHeaderName, Durability,
+    MAX_DEDUP_WINDOW_MICROS, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    PartitionResizePolicy,
 };
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKind, HeaderValue};
@@ -268,6 +269,18 @@ impl OptionValueCodec for DedupHeaderName {
     fn to_option_string(&self) -> String {
         self.to_string()
     }
+}
+
+/// A `dedup_identity` value: `header` or `message_id`, as a `String`.
+pub(super) fn decode_dedup_identity(
+    key: OptionKey,
+    entry: &WireUserHeaderEntry<'_>,
+) -> Result<&'static str, IggyError> {
+    parse_text(key, entry, |text| {
+        [DEDUP_IDENTITY_HEADER, DEDUP_IDENTITY_MESSAGE_ID]
+            .into_iter()
+            .find(|identity| *identity == text)
+    })
 }
 
 /// `InvalidOptionValue` naming `key`.

@@ -107,6 +107,15 @@ struct Cluster {
 
 impl Cluster {
     fn new(replicas: u8, clients: &[u128], network: &PacketSimulatorOptions) -> Self {
+        Self::with_options(replicas, clients, network, dedup_options())
+    }
+
+    fn with_options(
+        replicas: u8,
+        clients: &[u128],
+        network: &PacketSimulatorOptions,
+        options: WireOptions,
+    ) -> Self {
         init_pool();
         let network = PacketSimulatorOptions {
             node_count: replicas,
@@ -117,7 +126,7 @@ impl Cluster {
         let namespace = IggyNamespace::new(1, 1, 0);
         // Escape hatch for attributing a failure: the same run without the feature.
         if std::env::var("DEDUP_SIM_DISABLE").map_or(true, |value| value.is_empty()) {
-            sim.set_topic_options(namespace, dedup_options());
+            sim.set_topic_options(namespace, options);
         }
         sim.init_partition(namespace);
         Self { sim, namespace }
@@ -321,6 +330,128 @@ fn success(reply: &Message<ReplyHeader>) -> bool {
     reply.header().status == 0
 }
 
+/// Messages with caller-chosen IDs, as `SimClient::send_messages_with_ids` takes.
+type IdBatch = Vec<(u128, Bytes, Option<Bytes>)>;
+
+fn id_options() -> WireOptions {
+    TopicCreateOptions {
+        dedup_window: Some(IggyDuration::from(WINDOW_MICROS)),
+        dedup_identity: Some("message_id".to_string()),
+        ..TopicCreateOptions::default()
+    }
+    .to_wire()
+    .expect("dedup options encode")
+}
+
+#[test]
+fn given_header_topic_when_a_message_lacks_the_header_should_refuse_the_request_and_append_nothing()
+{
+    // Admitting it would leave that event undeduplicated for good: a producer
+    // that stopped stamping the header must fail loudly, not turn dedup off.
+    let mut cluster = Cluster::new(3, &[1], &PacketSimulatorOptions::default());
+    let client = SimClient::new(1);
+    cluster.sim.register_client_with_primary(&client);
+    let request = client.send_messages_with_headers(
+        cluster.namespace,
+        &[
+            (Bytes::from_static(b"a1"), Some(key_headers("a"))),
+            (Bytes::from_static(b"nokey"), None),
+        ],
+    );
+    let request_id = request.header().request;
+    cluster.submit(1, 0, request);
+    let reply = cluster.step_until_reply(1, request_id, 500).expect("reply");
+    assert_eq!(
+        reply.header().status,
+        IggyError::MessageDedupIdentityMissing.as_code()
+    );
+    cluster.settle(200);
+    for replica in cluster.live_replicas() {
+        assert!(
+            cluster.committed(replica).is_empty(),
+            "replica {replica} appended"
+        );
+    }
+
+    // The same event with its header goes through.
+    let request = client.send_messages_with_headers(
+        cluster.namespace,
+        &[(Bytes::from_static(b"a1"), Some(key_headers("a")))],
+    );
+    let request_id = request.header().request;
+    cluster.submit(1, 0, request);
+    assert!(success(
+        &cluster.step_until_reply(1, request_id, 500).expect("reply")
+    ));
+}
+
+#[test]
+fn given_message_id_topic_when_ids_repeat_across_sessions_should_commit_each_id_once_on_every_replica()
+ {
+    // Two producers resend the same IDs (a second replica of the feed, or a
+    // restart); ID 0 has no identity and is always kept.
+    let mut cluster =
+        Cluster::with_options(3, &[1, 2], &PacketSimulatorOptions::default(), id_options());
+    let first = SimClient::new(1);
+    let second = SimClient::new(2);
+    cluster.sim.register_client_with_primary(&first);
+    cluster.sim.register_client_with_primary(&second);
+    let sends: [(&SimClient, u128, IdBatch); 3] = [
+        (
+            &first,
+            1,
+            vec![
+                (10, Bytes::from_static(b"x"), None),
+                (11, Bytes::from_static(b"y"), None),
+            ],
+        ),
+        (
+            &second,
+            2,
+            vec![
+                (11, Bytes::from_static(b"y"), Some(key_headers("ignored"))),
+                (0, Bytes::from_static(b"anon"), None),
+                (12, Bytes::from_static(b"z"), None),
+                (12, Bytes::from_static(b"z"), None),
+            ],
+        ),
+        (
+            &first,
+            1,
+            vec![
+                (10, Bytes::from_static(b"x"), None),
+                (0, Bytes::from_static(b"anon"), None),
+            ],
+        ),
+    ];
+    for (client, client_id, batch) in sends {
+        let request = client.send_messages_with_ids(cluster.namespace, &batch);
+        let request_id = request.header().request;
+        cluster.submit(client_id, 0, request);
+        let reply = cluster
+            .step_until_reply(client_id, request_id, 500)
+            .expect("reply");
+        assert!(success(&reply));
+    }
+    cluster.settle(200);
+    for replica in cluster.live_replicas() {
+        let ids: Vec<u128> =
+            futures::executor::block_on(partition!(cluster, replica).committed_message_ids())
+                .into_iter()
+                .map(|(_, id)| id)
+                .collect();
+        assert_eq!(ids, vec![10, 11, 0, 12, 0], "replica {replica}");
+    }
+    cluster.assert_indexes_agree("message-id topic");
+
+    // A restarted replica rebuilds the same index from its log.
+    cluster.sim.replica_crash(2);
+    cluster.settle(20);
+    cluster.sim.replica_restart(2);
+    cluster.settle(1_000);
+    cluster.assert_indexes_agree("after restart");
+}
+
 #[test]
 fn given_dedup_topic_when_keys_repeat_should_commit_each_key_once_on_every_replica() {
     let mut cluster = Cluster::new(3, &[1], &PacketSimulatorOptions::default());
@@ -332,13 +463,11 @@ fn given_dedup_topic_when_keys_repeat_should_commit_each_key_once_on_every_repli
             (Bytes::from_static(b"a1"), Some(key_headers("a"))),
             (Bytes::from_static(b"b1"), Some(key_headers("b"))),
         ],
-        // Repeats of `a` and `b`, a new key, a repeat inside the batch, and a
-        // message with no key at all.
+        // Repeats of `a` and `b`, a new key, and a repeat inside the batch.
         vec![
             (Bytes::from_static(b"a2"), Some(key_headers("a"))),
             (Bytes::from_static(b"c1"), Some(key_headers("c"))),
             (Bytes::from_static(b"c2"), Some(key_headers("c"))),
-            (Bytes::from_static(b"nokey"), None),
             (Bytes::from_static(b"b2"), Some(key_headers("b"))),
         ],
     ];
@@ -351,8 +480,7 @@ fn given_dedup_topic_when_keys_repeat_should_commit_each_key_once_on_every_repli
     }
     cluster.settle(200);
 
-    let expected: Vec<Option<String>> =
-        vec![Some("a".into()), Some("b".into()), Some("c".into()), None];
+    let expected: Vec<Option<String>> = vec![Some("a".into()), Some("b".into()), Some("c".into())];
     for replica in cluster.live_replicas() {
         let keys: Vec<Option<String>> = cluster
             .committed(replica)

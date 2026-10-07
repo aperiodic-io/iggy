@@ -54,6 +54,7 @@ pub enum OptionKey {
     PreallocateSegments,
     DedupWindow,
     DedupHeader,
+    DedupIdentity,
     EncryptionKey,
     EncryptionKeyWrapped,
     EncryptionKeySource,

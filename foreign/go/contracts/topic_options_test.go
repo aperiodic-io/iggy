@@ -71,6 +71,13 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 			wantValue: []byte("dedup-key"),
 		},
 		{
+			name:      "dedup by message ID",
+			entry:     DedupMessageIDOption(),
+			wantKey:   "dedup_identity",
+			wantKind:  String,
+			wantValue: []byte("message_id"),
+		},
+		{
 			name:      "messages required to save",
 			entry:     MessagesRequiredToSaveOption(1024),
 			wantKey:   "messages_required_to_save",

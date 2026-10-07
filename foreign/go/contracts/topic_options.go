@@ -44,6 +44,7 @@ const (
 	TopicOptionPreallocateSegments          TopicOptionKey = "preallocate_segments"
 	TopicOptionDedupWindow                  TopicOptionKey = "dedup_window"
 	TopicOptionDedupHeader                  TopicOptionKey = "dedup_header"
+	TopicOptionDedupIdentity                TopicOptionKey = "dedup_identity"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -81,6 +82,8 @@ type TopicOptions struct {
 	DedupWindow *time.Duration
 	// DedupHeader, see DedupHeaderOption.
 	DedupHeader *string
+	// DedupIdentity, see DedupIdentityOption.
+	DedupIdentity *DedupIdentity
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -166,17 +169,18 @@ func PreallocateSegmentsOption(enabled bool) HeaderEntry {
 }
 
 // DedupWindowOption turns on message deduplication for the topic: within the
-// window, a message whose DedupHeaderOption header value was already appended
-// to the same partition is dropped. The window is sent in microseconds and is
-// capped server-side at one day. Zero leaves deduplication off. The server
-// refuses a non-zero window without a header.
+// window, a message whose identity (DedupHeaderOption's header value, or its
+// message ID with DedupMessageIDOption) was already appended to the same
+// partition is dropped. The window is sent in microseconds and is capped
+// server-side at one day. Zero leaves deduplication off. The server refuses a
+// non-zero window without an identity.
 func DedupWindowOption(window time.Duration) HeaderEntry {
 	return uint64Option(TopicOptionDedupWindow, uint64(window/time.Microsecond))
 }
 
 // DedupHeaderOption names the user header whose value identifies a message for
-// DedupWindowOption, matched byte for byte (1 to 64 bytes). Messages without it
-// are never deduplicated.
+// DedupWindowOption, matched byte for byte (1 to 64 bytes). A send carrying a
+// message without it is refused.
 func DedupHeaderOption(header string) HeaderEntry {
 	return stringOption(TopicOptionDedupHeader, header)
 }
@@ -186,6 +190,30 @@ func stringOption(key TopicOptionKey, value string) HeaderEntry {
 		Key:   HeaderKey{Kind: String, Value: []byte(key)},
 		Value: HeaderValue{Kind: String, Value: []byte(value)},
 	}
+}
+
+// DedupIdentity is what DedupWindowOption deduplicates on.
+type DedupIdentity string
+
+const (
+	// DedupIdentityHeader deduplicates on the DedupHeaderOption header, the
+	// default.
+	DedupIdentityHeader DedupIdentity = "header"
+	// DedupIdentityMessageID deduplicates on the message ID. Producers must
+	// then set their own IDs: an unset ID is replaced with a random one, and
+	// ID 0 is never deduplicated. Do not combine it with DedupHeaderOption.
+	DedupIdentityMessageID DedupIdentity = "message_id"
+)
+
+// DedupIdentityOption names what DedupWindowOption deduplicates on.
+func DedupIdentityOption(identity DedupIdentity) HeaderEntry {
+	return stringOption(TopicOptionDedupIdentity, string(identity))
+}
+
+// DedupMessageIDOption makes the message ID the identity DedupWindowOption
+// deduplicates on, instead of a header. See DedupIdentityMessageID.
+func DedupMessageIDOption() HeaderEntry {
+	return DedupIdentityOption(DedupIdentityMessageID)
 }
 
 func uint64Option(key TopicOptionKey, value uint64) HeaderEntry {

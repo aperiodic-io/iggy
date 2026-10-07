@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::codec::{OptionValueCodec, invalid};
+use super::codec::{OptionValueCodec, decode_dedup_identity, invalid};
 use super::key::OptionKey;
 use super::{
     DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
@@ -68,7 +68,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 21] = [
+pub static CATALOG: [OptionDescriptor; 22] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -290,10 +290,11 @@ pub static CATALOG: [OptionDescriptor; 21] = [
         critical: false,
         description: || {
             format!(
-                "Drop a message whose dedup_header value was already appended to the same \
-                 partition within this window: microseconds or a humantime string (e.g. 5m). \
-                 Absent or 0 disables deduplication. At most {MAX_DEDUP_WINDOW_MICROS} \
-                 microseconds. Requires dedup_header"
+                "Drop a message whose identity (dedup_identity) was already appended to the \
+                 same partition within this window, measured on prepare timestamps: \
+                 microseconds or a humantime string (e.g. 5m). Absent or 0 disables \
+                 deduplication. At most {MAX_DEDUP_WINDOW_MICROS} microseconds. Requires \
+                 dedup_header unless dedup_identity is message_id"
             )
         },
     },
@@ -309,9 +310,26 @@ pub static CATALOG: [OptionDescriptor; 21] = [
         description: || {
             format!(
                 "User-header key whose value identifies a message for dedup_window, matched \
-                 byte for byte, 1 to {MAX_DEDUP_HEADER_LENGTH} bytes. Messages without it are \
-                 never deduplicated"
+                 byte for byte, 1 to {MAX_DEDUP_HEADER_LENGTH} bytes. A request carrying a \
+                 message without it is refused"
             )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::DedupIdentity,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "What identifies a message for dedup_window: header (the dedup_header value, the \
+             default) or message_id (the message's own ID; ID 0 is never deduplicated, and \
+             SDKs replace an unset ID with a random one). dedup_header must be absent with \
+             message_id"
+                .to_owned()
         },
     },
     OptionDescriptor {
@@ -820,6 +838,7 @@ pub fn canonical_value(
         OptionKey::PreallocateSegments => bool::decode(key, entry)?.encode()?,
         OptionKey::DedupWindow => IggyDuration::decode(key, entry)?.encode()?,
         OptionKey::DedupHeader => DedupHeaderName::decode(key, entry)?.encode()?,
+        OptionKey::DedupIdentity => HeaderValue::try_from(decode_dedup_identity(key, entry)?)?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }
