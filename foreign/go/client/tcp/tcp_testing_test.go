@@ -18,6 +18,7 @@
 package tcp
 
 import (
+	"bufio"
 	"encoding/binary"
 	"io"
 	"log/slog"
@@ -258,10 +259,11 @@ func newPipeClient(t *testing.T) (*IggyTcpClient, net.Conn) {
 }
 
 // newTestClient builds a connected client over an established connection.
-func newTestClient(t *testing.T, conn net.Conn) *IggyTcpClient {
+func newTestClient(t testing.TB, conn net.Conn) *IggyTcpClient {
 	t.Helper()
 	client := &IggyTcpClient{
 		conn:           conn,
+		reader:         bufio.NewReaderSize(conn, connectionReadBufferSize),
 		transportState: iggcon.TransportStateConnected,
 		sessionState:   iggcon.SessionStateUnauthenticated,
 		logger:         slog.New(slog.DiscardHandler),

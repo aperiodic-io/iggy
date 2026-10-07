@@ -303,14 +303,88 @@ func TestE2E_SplitPrimaryManualCommitPreservesMembership(t *testing.T) {
 		assert.Equal(t, coordinator, connected.GetConnectionInfo().ServerAddress,
 			"the commit must not move the coordinator session")
 	}
-	stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
-	require.NoError(t, err)
-	require.NotNil(t, stored)
-	assert.Equal(t, uint64(1), stored.StoredOffset)
+	// GetConsumerOffset reads the coordinator's replica, which trails the
+	// primary that took the commit (see the README), so it converges rather
+	// than reads back at once.
+	require.Eventually(t, func() bool {
+		stored, err := connected.GetConsumerOffset(ctx, consumer, stream, topic, &partition)
+		return err == nil && stored != nil && stored.StoredOffset == 1
+	}, 5*time.Second, 50*time.Millisecond, "the manual commit must replicate to the coordinator's backup")
 	afterClient, err := connected.GetMe(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, beforeClient.ID, afterClient.ID, "the commit registered a new client identity")
 	assert.Equal(t, beforeClient.ConsumerGroupsCount, afterClient.ConsumerGroupsCount, "the commit dropped the group membership")
+}
+
+// A poll the caller gives up on mid-read must not cost the group membership:
+// a closed socket is a disconnect to the server, which logs the client out
+// and drops its member.
+func TestE2E_AbandonedPollKeepsGroupMembership(t *testing.T) {
+	const (
+		partitionsCount = 3
+		batches         = 10
+		batchSize       = 1000
+		messageSize     = 1000
+		pollCount       = batches * batchSize
+		pollDeadline    = 500 * time.Microsecond
+		pollAttempts    = 10
+	)
+	connected := connect(t)
+	ctx := context.Background()
+	streamId, topicId := scratchTopic(t, connected, partitionsCount)
+
+	// About 10 MB in partition 0, so a poll of all of it outlasts the
+	// deadline. Every partition needs a message for an offset to be stored.
+	payload := make([]byte, messageSize)
+	for range batches {
+		batch := make([]iggcon.IggyMessage, 0, batchSize)
+		for range batchSize {
+			message, err := iggcon.NewIggyMessage(payload)
+			require.NoError(t, err)
+			batch = append(batch, message)
+		}
+		_, err := connected.SendMessages(ctx, streamId, topicId, iggcon.PartitionId(0), batch)
+		require.NoError(t, err)
+	}
+	for partition := uint32(1); partition < partitionsCount; partition++ {
+		_, err := connected.SendMessages(ctx, streamId, topicId,
+			iggcon.PartitionId(partition), testMessages(t, 1))
+		require.NoError(t, err)
+	}
+
+	group, err := connected.CreateConsumerGroup(ctx, streamId, topicId, "go-e2e-abandoned-poll")
+	require.NoError(t, err)
+	groupId, err := iggcon.NewIdentifier(group.Id)
+	require.NoError(t, err)
+	require.NoError(t, connected.JoinConsumerGroup(ctx, streamId, topicId, groupId))
+	consumer := iggcon.NewGroupConsumer(groupId)
+	beforeClient, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	require.Equal(t, uint32(1), beforeClient.ConsumerGroupsCount)
+
+	partitionId := uint32(0)
+	for range pollAttempts {
+		pollCtx, cancel := context.WithTimeout(ctx, pollDeadline)
+		_, err = connected.PollMessages(pollCtx, streamId, topicId, consumer,
+			iggcon.NextPollingStrategy(), pollCount, false, &partitionId)
+		cancel()
+		if err != nil {
+			break
+		}
+	}
+	require.ErrorIs(t, err, context.DeadlineExceeded, "no poll outlasted its deadline")
+
+	for partition := range uint32(partitionsCount) {
+		require.NoError(t, connected.StoreConsumerOffset(ctx, consumer, streamId, topicId, 0, &partition),
+			"partition %d: the member no longer owns it", partition)
+	}
+	afterClient, err := connected.GetMe(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, beforeClient.ID, afterClient.ID, "the client lost its server identity")
+	assert.Equal(t, uint32(1), afterClient.ConsumerGroupsCount)
+	details, err := connected.GetConsumerGroup(ctx, streamId, topicId, groupId)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(1), details.MembersCount)
 }
 
 func TestE2E_RawRequestsDoNotGapMetadataRequestIDs(t *testing.T) {

@@ -20,9 +20,11 @@ package tcp
 import (
 	"context"
 	"log/slog"
+	"net"
 	"time"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 	"github.com/apache/iggy/foreign/go/internal/command"
 	"github.com/apache/iggy/foreign/go/internal/util"
 	"github.com/apache/iggy/foreign/go/internal/vsr"
@@ -85,12 +87,12 @@ func (c *IggyTcpClient) register(
 		return nil, err
 	}
 
-	identity, err := c.signIn(ctx, code, body)
+	identity, signedInConn, err := c.signIn(ctx, code, body)
 	if err != nil {
 		return nil, err
 	}
 
-	settled, err := c.settleOnLeader(ctx, code, body)
+	settled, err := c.settleOnLeader(ctx, code, body, signedInConn)
 	if err != nil {
 		return nil, err
 	}
@@ -107,23 +109,27 @@ func (c *IggyTcpClient) register(
 // A failed sign-in never writes the session state: a server-side reject leaves
 // the existing session untouched, and a connection that dies mid-attempt is
 // already reset by invalidateConnLocked.
-func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, net.Conn, error) {
 	bp := acquireRequestBuf()
 	defer releaseRequestBuf(bp)
-	frame := append(reserveHeader(*bp), body...)
-	*bp = frame
+	*bp = append(reserveHeader(*bp), body...)
 
-	response, err := c.exchange(ctx, code, frame)
+	response, generation, err := c.exchange(ctx, code, bp)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	registered, err := vsr.DecodeLoginRegister(response)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	c.mtx.Lock()
+	if c.conn == nil || c.connGeneration != generation {
+		c.mtx.Unlock()
+		return nil, nil, ierror.ErrDisconnected
+	}
+	signedInConn := c.conn
 	err = c.session.Bind(registered.Session)
 	if err == nil {
 		c.sessionState = iggcon.SessionStateAuthenticated
@@ -138,7 +144,7 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 	}
 	c.mtx.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, signedInConn, err
 	}
 
 	c.mtx.Lock()
@@ -147,7 +153,7 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 	c.logger.Info("Iggy client has signed in successfully.",
 		slog.String("client_address", signedInAddress),
 		slog.String("server_version", registered.ServerVersion))
-	return &iggcon.IdentityInfo{UserId: registered.UserID}, nil
+	return &iggcon.IdentityInfo{UserId: registered.UserID}, signedInConn, nil
 }
 
 // settleOnLeader moves a freshly signed-in session to the cluster leader.
@@ -163,7 +169,7 @@ func (c *IggyTcpClient) signIn(ctx context.Context, code uint32, body []byte) (*
 // under the shared redirect budget.
 //
 // Returns nil when the client stays where it is.
-func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte) (*iggcon.IdentityInfo, error) {
+func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []byte, hop net.Conn) (*iggcon.IdentityInfo, error) {
 	// A roster walk stays on the endpoint it dialed: the settlement below
 	// would put the connection straight back on the node whose partition
 	// replica keeps refusing the walked request. The marker is scoped to the
@@ -183,19 +189,26 @@ func (c *IggyTcpClient) settleOnLeader(ctx context.Context, code uint32, body []
 		c.mtx.Unlock()
 		redirect, err := c.redirectToLeader(
 			context.WithValue(ctx, connectScoped{}, struct{}{}), generation)
+		if err != nil {
+			_ = c.dropConn(hop)
+		}
 		if err != nil || !redirect {
 			return settled, err
 		}
 
 		// The replayed sign-in below owns the session; the redirected Connect
 		// must not sign in on its own, or the replay commits a second Register.
-		if err := c.Connect(suppressAutoLogin(ctx)); err != nil {
-			return nil, err
-		}
-		settled, err = c.signIn(ctx, code, body)
+		hop, err = c.connect(suppressAutoLogin(ctx))
 		if err != nil {
 			return nil, err
 		}
+		var signedInConn net.Conn
+		settled, signedInConn, err = c.signIn(ctx, code, body)
+		if err != nil {
+			_ = c.dropConn(hop)
+			return nil, err
+		}
+		hop = signedInConn
 	}
 }
 
@@ -316,7 +329,7 @@ func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64)
 	}
 	c.mtx.Unlock()
 
-	torn, err := c.disconnectGeneration(generation)
+	torn, err := c.disconnectGeneration(ctx, generation)
 	if err != nil {
 		return false, err
 	}
@@ -342,7 +355,7 @@ func (c *IggyTcpClient) redirectToLeader(ctx context.Context, generation uint64)
 // targets, and only walking the roster reaches that group's primary. The
 // refusal marks the request as never admitted and safe to re-issue anywhere;
 // the caller's request budget bounds the walk.
-func (c *IggyTcpClient) settleOnNextEndpoint(visited map[string]struct{}) (bool, error) {
+func (c *IggyTcpClient) settleOnNextEndpoint(ctx context.Context, visited map[string]struct{}) (bool, error) {
 	c.mtx.Lock()
 	current := c.currentServerAddress
 	roster := append([]string(nil), c.knownServerAddresses...)
@@ -358,7 +371,7 @@ func (c *IggyTcpClient) settleOnNextEndpoint(visited map[string]struct{}) (bool,
 		slog.String("current", current),
 		slog.String("next", next),
 	)
-	if err := c.disconnect(); err != nil {
+	if err := c.disconnect(ctx); err != nil {
 		return false, err
 	}
 

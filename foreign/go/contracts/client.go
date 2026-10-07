@@ -19,6 +19,22 @@ package iggcon
 
 import "context"
 
+// Client provides access to Iggy over the configured transport.
+//
+// On a signed-in TCP coordinator connection, cancellation during a socket write
+// waits for the write to finish within the 30 s request budget. Once written,
+// cancellation returns the context error promptly while the reply is drained
+// in the background. The request can still commit, but is not resent after the
+// caller gives up. The session and consumer group membership remain. Later
+// requests wait for the reply or the remainder of its budget; waiting for the
+// exchange gate honors each request's own context. Close interrupts
+// the exchange. If the budget expires, the connection is dropped; reconnecting
+// creates a new session and consumers must rejoin their groups.
+//
+// A cancel in flight during sign-in, logout or an exchange without a bound
+// session drops that connection. A cancel in flight on a primary data connection
+// drops only that connection, preserving the coordinator session and group
+// membership.
 type Client interface {
 	// Connect establishes the connection to the server.
 	Connect(ctx context.Context) error
@@ -130,6 +146,14 @@ type Client interface {
 	// These polls are never replayed automatically after an unknown outcome.
 	// Servers must support primary routing and consumer-session attachment.
 	//
+	// Standalone auto-commit polls are not replayed after a lost reply. With
+	// Next, the offset may already have advanced, so retrying can skip the
+	// unread batch.
+	//
+	// In a cluster, polls without auto-commit read the coordinator replica.
+	// Next polls may temporarily use the previous offset after a routed store
+	// or delete, repeating messages or skipping the intended rewind or restart.
+	//
 	// A group poll that names no partition is orchestrated client-side and
 	// has three outcomes:
 	//   - err == nil with PartitionId == NoAssignedPartition and an empty
@@ -156,6 +180,14 @@ type Client interface {
 
 	// StoreConsumerOffset store the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	//
+	// In a cluster, the write goes to the partition primary, like an
+	// auto-commit poll. The client asks the coordinator for the route and sends
+	// the write on a data connection attached to the coordinator session. The
+	// client must reach the advertised TCP address of the primary. If the write
+	// loses its reply, the call returns ErrTransientNotCommitted, not
+	// ErrDisconnected. The outcome is then unknown, and storing the same offset
+	// again is safe.
 	StoreConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -167,6 +199,11 @@ type Client interface {
 
 	// GetConsumerOffset get the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	//
+	// In a cluster, the read goes to the replica on the coordinator node. Right
+	// after a write on a primary on another node, it can return the previous
+	// offset for a short time. Next polls without auto-commit share this lag;
+	// see PollMessages.
 	GetConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -181,6 +218,12 @@ type Client interface {
 
 	// DeleteConsumerOffset delete the consumer offset for a specific consumer or consumer group for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to poll the messages.
+	//
+	// In a cluster, the delete takes the same route as StoreConsumerOffset. If
+	// the delete loses its reply, the call returns ErrTransientNotCommitted, not
+	// ErrDisconnected, and the outcome is then unknown.
+	// Retrying after a lost reply can return nil or ErrConsumerOffsetNotFound
+	// (status 3021). Both mean that no offset is stored.
 	DeleteConsumerOffset(
 		ctx context.Context,
 		consumer Consumer,
@@ -227,6 +270,8 @@ type Client interface {
 
 	// LeaveConsumerGroup leave a consumer group by unique ID or name for the given stream and topic by unique IDs or names.
 	// Authentication is required, and the permission to read the streams or topics.
+	// Later polls do not automatically rejoin this group, even if the leave
+	// returns an error. An explicit JoinConsumerGroup clears that intent.
 	LeaveConsumerGroup(
 		ctx context.Context,
 		streamId Identifier,
@@ -297,6 +342,9 @@ type Client interface {
 
 	// UpdateUser update a user by unique ID or username.
 	// Authentication is required, and the permission to manage the users.
+	// A canceled username update can still commit while the TCP client's
+	// remembered credentials remain unchanged. Explicitly sign in with the new
+	// username before relying on automatic reconnect after such a change.
 	UpdateUser(
 		ctx context.Context,
 		userID Identifier,
@@ -310,6 +358,9 @@ type Client interface {
 
 	// ChangePassword change the password of a user by unique ID or username.
 	// Authentication is required, and the permission to manage the users, unless the provided user ID is the same as the authenticated user.
+	// A canceled change can still commit while the TCP client's remembered
+	// password remains unchanged. Explicitly sign in with the new password
+	// before relying on automatic reconnect after such a change.
 	ChangePassword(
 		ctx context.Context,
 		userID Identifier,
