@@ -3073,6 +3073,7 @@ mod tests {
             floor: None,
             peer: 1,
             first_batch_offset: None,
+            first_batch_op: None,
             idle_ticks: 0,
         });
 
@@ -3204,6 +3205,7 @@ mod tests {
                 floor: Some(5),
                 peer: 1,
                 first_batch_offset: Some(20),
+                first_batch_op: None,
                 idle_ticks: 0,
             });
         }

@@ -309,6 +309,11 @@ pub struct RepairSession {
     /// floor are neither locally durable nor repaired (state-transfer
     /// territory), and the floor must be refused.
     pub first_batch_offset: Option<u64>,
+    /// The op whose batch set [`Self::first_batch_offset`]. Offsets rise with
+    /// ops, so once every op in `(floor, first_batch_op)` is resident no frame
+    /// still to come can lower the first batch offset, and a floor refused on
+    /// it is final even though the rest of the window has not arrived.
+    pub first_batch_op: Option<u64>,
     /// Ticks since the stream last made progress; at
     /// [`REPAIR_RETRY_TICKS`] the remaining window is re-requested.
     pub idle_ticks: u32,
