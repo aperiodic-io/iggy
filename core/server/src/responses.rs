@@ -712,9 +712,10 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             kind: HeaderKind::Uint64.as_code(),
             default_value: Bytes::copy_from_slice(&0u64.to_le_bytes()),
             description: format!(
-                "Drop a message whose dedup_header value was already appended to the same \
-                     partition within this window: micros or a humantime string (5m). \
-                     0 disables deduplication. At most {} micros. Requires dedup_header",
+                "Drop a message whose identity (dedup_identity) was already appended to the \
+                     same partition within this window, measured on prepare timestamps: \
+                     micros or a humantime string (5m). 0 disables deduplication. At most {} \
+                     micros. Requires dedup_header unless dedup_identity is message_id",
                 iggy_common::MAX_DEDUP_WINDOW_MICROS
             ),
         },
@@ -725,10 +726,20 @@ fn topic_option_descriptors() -> Result<Vec<OptionDescriptor>, IggyError> {
             default_value: Bytes::new(),
             description: format!(
                 "User-header key whose value identifies a message for dedup_window, \
-                     matched byte for byte, 1..={} bytes. Messages without it are never \
-                     deduplicated",
+                     matched byte for byte, 1..={} bytes. A request carrying a message \
+                     without it is refused",
                 iggy_common::MAX_DEDUP_HEADER_LENGTH
             ),
+        },
+        OptionDescriptor {
+            key: WireName::new(topic_option_keys::DEDUP_IDENTITY)
+                .map_err(|_| IggyError::InvalidFormat)?,
+            kind: HeaderKind::String.as_code(),
+            default_value: Bytes::from_static(b"header"),
+            description: "What identifies a message for dedup_window: header (the \
+                 dedup_header value) or message_id (the message's own ID; ID 0 is never \
+                 deduplicated, and SDKs replace an unset ID with a random one)"
+                .to_string(),
         },
     ])
 }

@@ -1426,6 +1426,7 @@ async fn assert_topic_recovered(
             .and(recovered.preallocate_segments),
         dedup_window: seed.dedup_window.and(recovered.dedup_window),
         dedup_header: seed.dedup_header.clone().and(recovered.dedup_header),
+        dedup_identity: seed.dedup_identity.clone().and(recovered.dedup_identity),
         raw: BTreeMap::new(),
     };
     assert_eq!(

@@ -627,14 +627,31 @@ impl SimClient {
         group: IggyNamespace,
         messages: &[(Bytes, Option<Bytes>)],
     ) -> Message<RoutedRequestHeader> {
+        let with_ids: Vec<(u128, Bytes, Option<Bytes>)> = messages
+            .iter()
+            .map(|(payload, headers)| (self.next_message_id(), payload.clone(), headers.clone()))
+            .collect();
+        self.send_messages_with_ids(group, &with_ids)
+    }
+
+    /// [`Self::send_messages_with_headers`] with caller-chosen message IDs, as
+    /// a producer deduplicating by message ID sets them.
+    ///
+    /// # Panics
+    /// Panics if the batch does not encode.
+    pub fn send_messages_with_ids(
+        &self,
+        group: IggyNamespace,
+        messages: &[(u128, Bytes, Option<Bytes>)],
+    ) -> Message<RoutedRequestHeader> {
         let to_u32 = |v: usize| u32::try_from(v).expect("group id fits u32");
         let stream_id = WireIdentifier::Numeric(to_u32(group.stream_id()));
         let topic_id = WireIdentifier::Numeric(to_u32(group.topic_id()));
         let partitioning = WirePartitioning::PartitionId(to_u32(group.partition_id()));
         let raw: Vec<RawMessage<'_>> = messages
             .iter()
-            .map(|(payload, headers)| RawMessage {
-                id: self.next_message_id(),
+            .map(|(id, payload, headers)| RawMessage {
+                id: *id,
                 origin_timestamp: 0,
                 headers: headers.as_deref(),
                 payload: payload.as_ref(),

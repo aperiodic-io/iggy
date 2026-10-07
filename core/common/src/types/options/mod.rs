@@ -57,8 +57,8 @@ mod dedup;
 mod durability;
 
 pub use dedup::{
-    DedupHeaderName, DedupHeaderNameError, MAX_DEDUP_HEADER_LENGTH, MAX_DEDUP_WINDOW_MICROS,
-    MessageDedupPolicy,
+    DEDUP_IDENTITY_HEADER, DEDUP_IDENTITY_MESSAGE_ID, DedupHeaderName, DedupHeaderNameError,
+    DedupIdentity, MAX_DEDUP_HEADER_LENGTH, MAX_DEDUP_WINDOW_MICROS, MessageDedupPolicy,
 };
 pub use durability::Durability;
 
@@ -234,8 +234,13 @@ pub mod topic_option_keys {
     /// (`5m`). `0` disables deduplication. Pairs with [`DEDUP_HEADER`].
     pub const DEDUP_WINDOW: &str = "dedup_window";
     /// User-header key whose value identifies a message for deduplication:
-    /// `String`, 1..=64 bytes. Required when [`DEDUP_WINDOW`] is non-zero.
+    /// `String`, 1..=64 bytes. Required when [`DEDUP_WINDOW`] is non-zero,
+    /// unless [`DEDUP_IDENTITY`] is `message_id`.
     pub const DEDUP_HEADER: &str = "dedup_header";
+    /// What identifies a message for deduplication: `String`, `header` (the
+    /// default when [`DEDUP_HEADER`] is set) or `message_id` (the message's
+    /// own ID; [`DEDUP_HEADER`] must then be absent).
+    pub const DEDUP_IDENTITY: &str = "dedup_identity";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -462,6 +467,7 @@ pub const TOPIC_OPTION_KEYS: &[&str] = &[
     topic_option_keys::PREALLOCATE_SEGMENTS,
     topic_option_keys::DEDUP_WINDOW,
     topic_option_keys::DEDUP_HEADER,
+    topic_option_keys::DEDUP_IDENTITY,
 ];
 
 /// The subset of [`TOPIC_OPTION_KEYS`] an `UpdateTopic` options block may
@@ -615,8 +621,8 @@ pub struct TopicRuntimeOptions {
     pub messages_required_to_save: Option<u32>,
     pub size_of_messages_required_to_save: Option<IggyByteSize>,
     pub preallocate_segments: Option<bool>,
-    /// `None` unless the topic set both a non-zero `dedup_window` and a
-    /// `dedup_header`.
+    /// `None` unless the topic set both a non-zero `dedup_window` and an
+    /// identity (`dedup_header`, or `dedup_identity=message_id`).
     pub message_dedup: Option<MessageDedupPolicy>,
 }
 
@@ -744,8 +750,11 @@ pub struct TopicCreateOptions {
     /// Message deduplication window. `None` and zero both disable it.
     pub dedup_window: Option<IggyDuration>,
     /// User-header key deduplication reads the message identity from.
-    /// Required when `dedup_window` is non-zero.
+    /// Required when `dedup_window` is non-zero, unless `dedup_identity` is
+    /// `message_id`.
     pub dedup_header: Option<String>,
+    /// `header` or `message_id`; absent means `header`.
+    pub dedup_identity: Option<String>,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
     /// server catalog after this build shipped. Outbound only: a typed field
@@ -785,10 +794,18 @@ impl TopicCreateOptions {
             let key = String::from_utf8_lossy(entry.key);
             parsed.absorb_strict(&entry, &key)?;
         }
-        // A window without a header would admit a topic that silently never
-        // dedups. Checked here, not per key, because the two keys can arrive
-        // in either order.
+        // A window needs exactly one identity: a header, or an explicit
+        // `message_id`. A window with neither would admit a topic that
+        // silently never dedups, and `message_id` with a header names two.
+        // Checked here, not per key, because the keys can arrive in any order.
+        let message_id = parsed.dedup_identity.as_deref() == Some(DEDUP_IDENTITY_MESSAGE_ID);
+        if message_id && parsed.dedup_header.is_some() {
+            return Err(IggyError::InvalidOptionValue(
+                topic_option_keys::DEDUP_IDENTITY.to_owned(),
+            ));
+        }
         if parsed.dedup_window.is_some_and(|window| !window.is_zero())
+            && !message_id
             && parsed.dedup_header.is_none()
         {
             return Err(IggyError::InvalidOptionValue(
@@ -802,8 +819,12 @@ impl TopicCreateOptions {
     #[must_use]
     pub fn message_dedup_policy(&self) -> Option<MessageDedupPolicy> {
         let window = self.dedup_window.filter(|window| !window.is_zero())?;
-        let header = DedupHeaderName::from_str(self.dedup_header.as_deref()?).ok()?;
-        Some(MessageDedupPolicy { window, header })
+        let identity = if self.dedup_identity.as_deref() == Some(DEDUP_IDENTITY_MESSAGE_ID) {
+            DedupIdentity::MessageId
+        } else {
+            DedupIdentity::Header(DedupHeaderName::from_str(self.dedup_header.as_deref()?).ok()?)
+        };
+        Some(MessageDedupPolicy { window, identity })
     }
 
     /// Parse a block that is already COMMITTED, skipping what this build
@@ -902,6 +923,17 @@ impl TopicCreateOptions {
                         .map_err(|_| IggyError::InvalidOptionValue(key.to_string()))?;
                     parsed.dedup_header = Some(name.to_owned());
                 }
+                topic_option_keys::DEDUP_IDENTITY => {
+                    if entry.value_kind.0 != HeaderKind::String.as_code() {
+                        return Err(IggyError::InvalidOptionValue(key.to_string()));
+                    }
+                    let identity = std::str::from_utf8(entry.value)
+                        .map_err(|_| IggyError::InvalidOptionValue(key.to_string()))?;
+                    if identity != DEDUP_IDENTITY_HEADER && identity != DEDUP_IDENTITY_MESSAGE_ID {
+                        return Err(IggyError::InvalidOptionValue(key.to_string()));
+                    }
+                    parsed.dedup_identity = Some(identity.to_owned());
+                }
                 _ => return Err(IggyError::UnsupportedOptionKey(key.to_string())),
             }
         }
@@ -938,6 +970,10 @@ impl TopicCreateOptions {
                 .dedup_header
                 .clone()
                 .or_else(|| defaults.dedup_header.clone()),
+            dedup_identity: self
+                .dedup_identity
+                .clone()
+                .or_else(|| defaults.dedup_identity.clone()),
             raw: BTreeMap::new(),
         }
     }
@@ -1055,6 +1091,13 @@ impl TopicCreateOptions {
                 OptionValue::explicit(HeaderValue::from_str(dedup_header)?),
             );
         }
+        if let Some(dedup_identity) = &self.dedup_identity {
+            options.insert(
+                HeaderKey::from_str(topic_option_keys::DEDUP_IDENTITY)
+                    .expect("catalog key is a valid header key"),
+                OptionValue::explicit(HeaderValue::from_str(dedup_identity)?),
+            );
+        }
         Ok(options)
     }
 
@@ -1120,6 +1163,12 @@ impl TopicCreateOptions {
             options.insert(
                 topic_option_keys::DEDUP_HEADER.to_owned(),
                 dedup_header.clone(),
+            );
+        }
+        if let Some(dedup_identity) = &self.dedup_identity {
+            options.insert(
+                topic_option_keys::DEDUP_IDENTITY.to_owned(),
+                dedup_identity.clone(),
             );
         }
         Ok(options)
@@ -1384,6 +1433,7 @@ mod tests {
             preallocate_segments: Some(false),
             dedup_window: Some(IggyDuration::from(300_000_000u64)),
             dedup_header: Some("dedup-key".to_string()),
+            dedup_identity: None,
             partitions_count: None,
             consumer_offset_durability: Durability::Replicated,
             raw: BTreeMap::new(),
@@ -1803,7 +1853,48 @@ mod tests {
         let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
         let policy = parsed.message_dedup_policy().expect("both keys set");
         assert_eq!(policy.window_micros(), 300_000_000);
-        assert_eq!(policy.header.as_bytes(), b"dedup-key");
+        assert_eq!(
+            policy.identity,
+            DedupIdentity::Header(DedupHeaderName::from_str("dedup-key").unwrap())
+        );
+    }
+
+    #[test]
+    fn message_id_identity_needs_no_header_and_refuses_one() {
+        let options = dedup_raw(&[
+            (topic_option_keys::DEDUP_WINDOW, "5m"),
+            (topic_option_keys::DEDUP_IDENTITY, "message_id"),
+        ]);
+        let parsed = TopicCreateOptions::parse(&options.to_wire().unwrap()).unwrap();
+        let policy = parsed
+            .message_dedup_policy()
+            .expect("window and identity set");
+        assert_eq!(policy.identity, DedupIdentity::MessageId);
+
+        // Naming two identities is a configuration mistake, not a choice.
+        let both = dedup_raw(&[
+            (topic_option_keys::DEDUP_WINDOW, "5m"),
+            (topic_option_keys::DEDUP_IDENTITY, "message_id"),
+            (topic_option_keys::DEDUP_HEADER, "dedup-key"),
+        ]);
+        assert_eq!(
+            TopicCreateOptions::parse(&both.to_wire().unwrap()),
+            Err(IggyError::InvalidOptionValue(
+                topic_option_keys::DEDUP_IDENTITY.to_string()
+            ))
+        );
+        let unknown = dedup_raw(&[
+            (topic_option_keys::DEDUP_WINDOW, "5m"),
+            (topic_option_keys::DEDUP_IDENTITY, "payload"),
+        ]);
+        assert!(TopicCreateOptions::parse(&unknown.to_wire().unwrap()).is_err());
+
+        // `header` spelled out is the default, and still needs its header.
+        let header_without_name = dedup_raw(&[
+            (topic_option_keys::DEDUP_WINDOW, "5m"),
+            (topic_option_keys::DEDUP_IDENTITY, "header"),
+        ]);
+        assert!(TopicCreateOptions::parse(&header_without_name.to_wire().unwrap()).is_err());
     }
 
     #[test]
@@ -1867,7 +1958,21 @@ mod tests {
         let runtime = TopicRuntimeOptions::from_resource_options(&map);
         let policy = runtime.message_dedup.expect("policy restored from map");
         assert_eq!(policy.window_micros(), 60_000_000);
-        assert_eq!(policy.header.as_bytes(), b"event-id");
+        assert_eq!(
+            policy.identity,
+            DedupIdentity::Header(DedupHeaderName::from_str("event-id").unwrap())
+        );
+
+        let by_id = TopicCreateOptions {
+            dedup_window: Some(IggyDuration::from(60_000_000u64)),
+            dedup_identity: Some("message_id".to_string()),
+            ..TopicCreateOptions::default()
+        };
+        let runtime = TopicRuntimeOptions::from_resource_options(&by_id.to_option_map().unwrap());
+        assert_eq!(
+            runtime.message_dedup.map(|policy| policy.identity),
+            Some(DedupIdentity::MessageId)
+        );
     }
 
     #[test]

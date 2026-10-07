@@ -212,6 +212,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case unsupportedOptionKey = 4041
     case invalidOptionValue = 4042
     case optionsBlockTooLarge = 4043
+    case messageDedupIdentityMissing = 4044
     case cannotSendMessagesDueToClientDisconnection = 4050
     case backgroundSendError = 4051
     case backgroundSendTimeout = 4052
@@ -460,6 +461,7 @@ extension IggyErrorCode {
         case .unsupportedOptionKey: "unsupported_option_key"
         case .invalidOptionValue: "invalid_option_value"
         case .optionsBlockTooLarge: "options_block_too_large"
+        case .messageDedupIdentityMissing: "message_dedup_identity_missing"
         case .cannotSendMessagesDueToClientDisconnection: "cannot_send_messages_due_to_client_disconnection"
         case .backgroundSendError: "background_send_error"
         case .backgroundSendTimeout: "background_send_timeout"
