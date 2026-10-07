@@ -2753,6 +2753,32 @@ where
     )
 }
 
+/// Whether a transfer descriptor comes from a replica that knows less than this
+/// one: the phantom view-0 primary signature (a group whose directory vanished
+/// comes up Normal at view 0 over an empty, trivially caught-up log).
+///
+/// The serving view is compared against this replica's `log_view`, the last
+/// view whose log it adopted, NOT its current `view`. A replica that needs state transfer cannot finish a view
+/// change, and with persisted durability it cannot even vote in one (its WAL
+/// cannot certify a holed log, so every view-scoped send is withheld): its
+/// elections time out alone and ratchet `view` far past the cluster's, which
+/// never hears them. Compared against that view, every offer from the group's
+/// real primary looked stale although it held more committed state, and the
+/// replica stayed behind for good, serving reads from its prefix. A peer at or
+/// above the newest view this replica's log belongs to, holding at least the
+/// commit point it knows, is not behind it.
+const fn transfer_offer_is_behind<B, P>(
+    serving_view: u32,
+    serving_commit_max: u64,
+    local: &VsrConsensus<B, P>,
+) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    serving_view < local.log_view() || serving_commit_max < local.commit_max()
+}
+
 /// The next replica to try after a transfer against `failed_peer` failed.
 ///
 /// Prefers the view's primary: it is the only replica that can pass the serving
@@ -9361,6 +9387,7 @@ where
         // caught up). Installing it would unlink a chain this replica already
         // holds; nonce match alone cannot tell the two apart.
         let local_view = partition.consensus().view();
+        let local_log_view = partition.consensus().log_view();
         let local_commit_max = partition.consensus().commit_max();
         // `commit_op` past the sender's OWN `commit_max` is self-contradictory:
         // the offer cannot be built past the frontier its builder had. Nothing
@@ -9383,7 +9410,7 @@ where
                 .await;
             return;
         }
-        if header.view < local_view || header.commit_max < local_commit_max {
+        if transfer_offer_is_behind(header.view, header.commit_max, partition.consensus()) {
             tracing::warn!(
                 shard = self.id,
                 namespace_raw = header.group,
@@ -9391,6 +9418,7 @@ where
                 serving_view = header.view,
                 serving_commit_max = header.commit_max,
                 local_view,
+                local_log_view,
                 local_commit_max,
                 "refusing a partition transfer offer from a replica behind this one"
             );
@@ -13493,6 +13521,58 @@ mod metadata_repair_session_tests {
         // A frame was lost inside the served chunk: re-requesting now would
         // race the retry timer for the same window.
         assert!(!repair_chunk_walked(5, 5, 12));
+    }
+}
+
+#[cfg(test)]
+mod transfer_descriptor_gate_tests {
+    //! Which state-transfer descriptors a replica refuses as coming from a
+    //! replica behind it.
+
+    use super::transfer_offer_is_behind;
+    use consensus::{LocalPipeline, VsrConsensus};
+    use message_bus::IggyMessageBus;
+
+    /// A replica whose log was last adopted in `log_view`, whose own view has
+    /// since moved to `view`, and which knows `commit_max`.
+    fn replica(view: u32, log_view: u32, commit_max: u64) -> VsrConsensus<IggyMessageBus> {
+        let mut consensus =
+            VsrConsensus::new(1, 0, 3, 42, IggyMessageBus::new(0), LocalPipeline::new());
+        consensus.init();
+        consensus.set_view(view);
+        consensus.set_log_view(log_view);
+        consensus.advance_commit_max(commit_max);
+        consensus
+    }
+
+    #[test]
+    fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_should_accept() {
+        // The U3 wedge, numbers from a reproduction: the lagging replica last
+        // adopted view 11, solo elections that nobody heard pushed its view to
+        // 58, and the group's primary at view 20 offers more committed state
+        // than it holds. Refusing it kept the replica behind for good.
+        let lagging = replica(58, 11, 53_052);
+        assert!(!transfer_offer_is_behind(20, 55_013, &lagging));
+    }
+
+    #[test]
+    fn given_an_offer_from_before_the_view_this_log_adopted_when_checked_should_refuse() {
+        let replica = replica(11, 11, 53_052);
+        assert!(transfer_offer_is_behind(10, 55_013, &replica));
+    }
+
+    #[test]
+    fn given_an_offer_below_the_known_commit_point_when_checked_should_refuse() {
+        let replica = replica(58, 11, 53_052);
+        assert!(transfer_offer_is_behind(20, 53_000, &replica));
+    }
+
+    #[test]
+    fn given_a_phantom_view_zero_primary_when_checked_should_refuse() {
+        // An empty group at view 0 must never unlink a chain this replica
+        // holds, whichever comparison catches it.
+        assert!(transfer_offer_is_behind(0, 0, &replica(3, 1, 0)));
+        assert!(transfer_offer_is_behind(0, 0, &replica(0, 0, 42)));
     }
 }
 
