@@ -8383,6 +8383,9 @@ where
         // cursor that stood still would re-skip the same tail forever.
         let mut walk_cursor: Option<IggyNamespace> = None;
 
+        let dedup_budget = partitions.message_dedup_budget();
+        self.metrics
+            .record_message_dedup_shard_budget(dedup_budget.entries(), dedup_budget.limit());
         let mut fatal: Option<FatalCommit> = None;
         for namespace in namespace_scratch.drain(..) {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
@@ -8406,11 +8409,15 @@ where
                     .record_partition_applied_log_contradictions(contradictions);
             }
             if partition.message_dedup_policy().is_some() {
+                partition.tick_message_dedup().await;
                 let dedup = partition.take_message_dedup_counters();
                 self.metrics.record_partition_message_dedup(
                     &dedup_partition_label(namespace),
                     &metrics::MessageDedupSample {
                         dropped: dedup.dropped,
+                        dropped_in_flight: dedup.dropped_in_flight,
+                        awaited: dedup.awaited,
+                        evicted_budget: dedup.evicted_budget,
                         deferred: dedup.deferred,
                         missing_identity: dedup.missing_identity,
                         unindexed: dedup.unindexed,
