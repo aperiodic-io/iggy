@@ -121,6 +121,9 @@ pub struct DedupPartitionLabel {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MessageDedupSample {
     pub dropped: u64,
+    pub dropped_in_flight: u64,
+    pub awaited: u64,
+    pub evicted_budget: u64,
     pub deferred: u64,
     pub missing_identity: u64,
     pub unindexed: u64,
@@ -314,6 +317,11 @@ pub struct ShardMetrics {
     partition_requests_denied_transient_total: Counter,
     partition_prepare_gap_drops_total: Counter,
     partition_message_dedup_dropped_total: Counter,
+    partition_message_dedup_dropped_in_flight_total: Counter,
+    partition_message_dedup_awaited_total: Counter,
+    partition_message_dedup_evicted_budget_total: Counter,
+    message_dedup_shard_entries: Gauge,
+    message_dedup_shard_entries_limit: Gauge,
     partition_message_dedup_evicted_live_total: Counter,
     partition_message_dedup_deferred_total: Counter,
     partition_message_dedup_missing_identity_total: Counter,
@@ -404,6 +412,11 @@ impl ShardMetrics {
             partition_requests_denied_transient_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
             partition_message_dedup_dropped_total: Counter::default(),
+            partition_message_dedup_dropped_in_flight_total: Counter::default(),
+            partition_message_dedup_awaited_total: Counter::default(),
+            partition_message_dedup_evicted_budget_total: Counter::default(),
+            message_dedup_shard_entries: Gauge::default(),
+            message_dedup_shard_entries_limit: Gauge::default(),
             partition_message_dedup_evicted_live_total: Counter::default(),
             partition_message_dedup_deferred_total: Counter::default(),
             partition_message_dedup_missing_identity_total: Counter::default(),
@@ -463,6 +476,31 @@ impl ShardMetrics {
             "partition_message_dedup_dropped",
             "messages removed from produce requests as duplicates of a key inside the topic's dedup_window",
             self.partition_message_dedup_dropped_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_dropped_in_flight",
+            "messages removed from produce requests as duplicates of a key still in flight in the primary's pipeline (redundant producers); the request completes after its original",
+            self.partition_message_dedup_dropped_in_flight_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_awaited",
+            "all-duplicate produce requests answered once the in-flight originals they matched committed",
+            self.partition_message_dedup_awaited_total.clone(),
+        );
+        registry.register(
+            "partition_message_dedup_evicted_budget",
+            "dedup keys the shard budget ([partition] message_dedup_entries_per_shard_max) took from the largest index on the shard while still inside their window",
+            self.partition_message_dedup_evicted_budget_total.clone(),
+        );
+        registry.register(
+            "message_dedup_shard_entries",
+            "committed dedup keys held by every deduplicating partition of this shard",
+            self.message_dedup_shard_entries.clone(),
+        );
+        registry.register(
+            "message_dedup_shard_entries_limit",
+            "[partition] message_dedup_entries_per_shard_max; 0 means no shard budget",
+            self.message_dedup_shard_entries_limit.clone(),
         );
         registry.register(
             "partition_message_dedup_evicted_live",
@@ -942,6 +980,12 @@ impl ShardMetrics {
     ) {
         self.partition_message_dedup_dropped_total
             .inc_by(sample.dropped);
+        self.partition_message_dedup_dropped_in_flight_total
+            .inc_by(sample.dropped_in_flight);
+        self.partition_message_dedup_awaited_total
+            .inc_by(sample.awaited);
+        self.partition_message_dedup_evicted_budget_total
+            .inc_by(sample.evicted_budget);
         self.partition_message_dedup_evicted_live_total
             .inc_by(sample.evicted_live);
         self.partition_message_dedup_deferred_total
@@ -966,6 +1010,14 @@ impl ShardMetrics {
                 .get_or_create(partition)
                 .set(sample.allocated_bytes as i64);
         }
+    }
+
+    /// Set the shard budget gauges: committed dedup keys across the shard and
+    /// the limit they are held to.
+    #[allow(clippy::cast_possible_wrap)]
+    pub fn record_message_dedup_shard_budget(&self, entries: usize, limit: usize) {
+        self.message_dedup_shard_entries.set(entries as i64);
+        self.message_dedup_shard_entries_limit.set(limit as i64);
     }
 
     /// Drop a removed partition's per-partition dedup series.

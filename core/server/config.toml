@@ -1063,6 +1063,17 @@ consumer_offsets_max = 4096
 # Must be > 0 and <= 16777216.
 message_dedup_entries_max = 1000000
 
+# Distinct message-dedup keys all deduplicating partitions of one shard keep
+# together (integer). Shards balance partition counts, not index sizes, so a few
+# busy partitions on one shard can add up past the node's memory under
+# message_dedup_entries_max alone. At the budget the largest index on the shard
+# gives up its oldest keys (partition_message_dedup_evicted_budget_total), which
+# weakens deduplication but never loses a message; message_dedup_shard_entries
+# reports the current total. Size it to the memory one shard may spend at
+# 60-100 bytes a key. 0 means no shard budget.
+# Must be <= 268435456.
+message_dedup_entries_per_shard_max = 0
+
 # Consumer-offset durability is selected per topic by consumer_offset_durability.
 # It independently defaults to replicated, just like message durability.
 # Poll auto-commit submits an offset write asynchronously. A poll response does

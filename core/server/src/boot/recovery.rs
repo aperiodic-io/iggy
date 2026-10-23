@@ -188,6 +188,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         },
         owned_partitions_capacity,
     );
+    partitions.set_message_dedup_shard_budget(config.partition.message_dedup_entries_per_shard_max);
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by

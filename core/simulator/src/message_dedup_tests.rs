@@ -290,6 +290,18 @@ impl Cluster {
     /// must hold the same index.
     fn assert_indexes_agree(&self, context: &str) {
         let live = self.live_replicas();
+        // Compared as of the newest clock among them: an idle sweep drops only
+        // entries whose window ended before its own replica's clock, so every
+        // entry still live then is held by every replica at the same commit.
+        let now = live
+            .iter()
+            .map(|replica| {
+                partition!(self, *replica)
+                    .consensus()
+                    .peek_monotonic_timestamp()
+            })
+            .max()
+            .expect("a live replica");
         let fingerprints: BTreeMap<u8, (u64, usize, u128)> = live
             .iter()
             .map(|replica| {
@@ -299,7 +311,7 @@ impl Cluster {
                     (
                         partition.consensus().commit_min(),
                         0,
-                        partition.message_dedup_fingerprint(),
+                        partition.message_dedup_fingerprint_live(now),
                     ),
                 )
             })
@@ -554,11 +566,36 @@ fn given_committed_originals_when_whole_batch_repeats_should_succeed_without_app
     assert!(dropped >= 2, "the drop must be metered, saw {dropped}");
 }
 
+/// Replies for `(client, request)` pairs seen over up to `max_steps` steps,
+/// stopping once every pair has one.
+fn collect_replies(
+    cluster: &mut Cluster,
+    wanted: &[(u128, u64)],
+    max_steps: usize,
+) -> BTreeMap<(u128, u64), Message<ReplyHeader>> {
+    let mut replies = BTreeMap::new();
+    for _ in 0..max_steps {
+        for reply in cluster.sim.step() {
+            let id = (reply.header().client, reply.header().request);
+            if wanted.contains(&id) {
+                replies.entry(id).or_insert(reply);
+            }
+        }
+        if replies.len() == wanted.len() {
+            break;
+        }
+    }
+    replies
+}
+
 #[test]
-fn given_uncommitted_original_when_whole_batch_repeats_should_answer_transient_then_succeed() {
-    // The duplicate lands while its original is still in the pipeline. A
-    // success here would be a lie if a view change truncated the original,
-    // so it must be refused transiently, and succeed once the original commits.
+fn given_uncommitted_original_when_whole_batch_repeats_should_succeed_only_after_the_original_commits()
+ {
+    // Redundant producers: the duplicate lands while its original is still
+    // in the primary's pipeline. It is dropped and parked, not refused (a
+    // refusal costs the second producer a retry interval per event), and is
+    // answered only once the original commits: a success before that would
+    // be a lie if a view change truncated the original.
     let mut cluster = Cluster::new(3, &[1, 2], &PacketSimulatorOptions::default());
     let producer = SimClient::new(1);
     let resender = SimClient::new(2);
@@ -570,7 +607,6 @@ fn given_uncommitted_original_when_whole_batch_repeats_should_answer_transient_t
     let original_id = original.header().request;
     let repeat = resender.send_messages_with_headers(cluster.namespace, &batch);
     let repeat_id = repeat.header().request;
-    let repeat_again = repeat.deep_copy();
     // Cut the backups off so the original cannot reach quorum while the
     // duplicate is screened.
     cluster.sim.network.process_disable(ProcessId::Replica(1));
@@ -579,43 +615,74 @@ fn given_uncommitted_original_when_whole_batch_repeats_should_answer_transient_t
     cluster.settle(50);
     cluster.submit(2, 0, repeat);
 
-    let repeat_reply = cluster
-        .step_until_reply(2, repeat_id, 300)
-        .expect("the duplicate is answered at admission, without quorum");
-    assert_eq!(
-        repeat_reply.header().status,
-        IggyError::TransientNotCommitted.as_code(),
-        "a duplicate of an uncommitted message must not claim success"
+    assert!(
+        cluster.step_until_reply(2, repeat_id, 300).is_none(),
+        "a duplicate of an uncommitted message must not be answered before its original commits"
     );
     cluster.sim.network.process_enable(ProcessId::Replica(1));
     cluster.sim.network.process_enable(ProcessId::Replica(2));
 
-    let mut original_reply = None;
-    for _ in 0..2_000 {
-        if let Some(reply) = cluster
-            .sim
-            .step()
-            .into_iter()
-            .find(|reply| reply.header().client == 1 && reply.header().request == original_id)
-        {
-            original_reply = Some(reply);
-            break;
-        }
-    }
-    assert!(success(
-        &original_reply.expect("original commits once quorum returns")
-    ));
-
-    cluster.submit(2, 0, repeat_again);
-    let retried = cluster
-        .step_until_reply(2, repeat_id, 500)
-        .expect("retry reply");
-    assert!(success(&retried));
+    let replies = collect_replies(&mut cluster, &[(1, original_id), (2, repeat_id)], 2_000);
+    assert!(
+        success(&replies[&(1, original_id)]),
+        "the original commits once quorum returns"
+    );
+    assert!(
+        success(&replies[&(2, repeat_id)]),
+        "the parked duplicate succeeds after it"
+    );
     cluster.settle(100);
     let acked: BTreeSet<String> = std::iter::once("pending".to_string()).collect();
     cluster.assert_invariants("pending", &acked);
     for replica in cluster.live_replicas() {
         assert_eq!(cluster.committed(replica).len(), 1, "replica {replica}");
+    }
+}
+
+#[test]
+fn given_uncommitted_original_when_a_batch_partly_repeats_should_append_only_the_new_messages() {
+    // The second feed runs one event ahead of the first: its batch holds the
+    // in-flight event and a new one. Refusing it would hold the new event
+    // back; instead the duplicate is dropped and the rest rides behind the
+    // original as a later prepare, which can only commit after it.
+    let mut cluster = Cluster::new(3, &[1, 2], &PacketSimulatorOptions::default());
+    let producer = SimClient::new(1);
+    let resender = SimClient::new(2);
+    cluster.sim.register_client_with_primary(&producer);
+    cluster.sim.register_client_with_primary(&resender);
+    let original = producer.send_messages_with_headers(
+        cluster.namespace,
+        &[(Bytes::from_static(b"p"), Some(key_headers("pending")))],
+    );
+    let original_id = original.header().request;
+    let ahead = resender.send_messages_with_headers(
+        cluster.namespace,
+        &[
+            (Bytes::from_static(b"p"), Some(key_headers("pending"))),
+            (Bytes::from_static(b"f"), Some(key_headers("fresh"))),
+        ],
+    );
+    let ahead_id = ahead.header().request;
+    cluster.sim.network.process_disable(ProcessId::Replica(1));
+    cluster.sim.network.process_disable(ProcessId::Replica(2));
+    cluster.submit(1, 0, original);
+    cluster.settle(50);
+    cluster.submit(2, 0, ahead);
+    cluster.settle(50);
+    cluster.sim.network.process_enable(ProcessId::Replica(1));
+    cluster.sim.network.process_enable(ProcessId::Replica(2));
+
+    let replies = collect_replies(&mut cluster, &[(1, original_id), (2, ahead_id)], 2_000);
+    assert!(success(&replies[&(1, original_id)]));
+    assert!(success(&replies[&(2, ahead_id)]));
+    cluster.settle(100);
+    let acked: BTreeSet<String> = ["pending", "fresh"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    cluster.assert_invariants("partial", &acked);
+    for replica in cluster.live_replicas() {
+        assert_eq!(cluster.committed(replica).len(), 2, "replica {replica}");
     }
 }
 
