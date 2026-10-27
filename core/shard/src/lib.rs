@@ -3081,6 +3081,8 @@ where
                     // races (the partition is gone, so the frames are moot).
                     self.discard_parked_partition_frames(namespace);
                     self.metrics.record_partition_removed();
+                    self.metrics
+                        .forget_partition_message_dedup(&dedup_partition_label(namespace));
                     confirmed_remove = true;
                     if let Some(partition) = removed {
                         // Tail of the gap-drop count. The tick sweep drains it
@@ -5013,6 +5015,13 @@ where
         // would prevent truncation from restoring the earlier append point.
         if self.partition_consensus.replica_count == 1 && !partition.durability().is_persisted() {
             partition.reanchor_in_memory_to_mint_frontier(partitions.config().segment_size);
+        }
+        // The boot paths rebuild the message-dedup index from committed storage
+        // after recovery; so must this one, or a restarted simulated replica
+        // would promote with an index its production counterpart would have.
+        // In-memory reads never suspend on the reactor, so blocking is sound.
+        if partition.message_dedup_policy().is_some() {
+            futures::executor::block_on(partition.rebuild_message_dedup_index());
         }
         partitions.insert(namespace, partition);
         if self.redispatch_parked_frames(namespace, epoch) {
@@ -8592,6 +8601,9 @@ where
         // cursor that stood still would re-skip the same tail forever.
         let mut walk_cursor: Option<IggyNamespace> = None;
 
+        let dedup_budget = partitions.message_dedup_budget();
+        self.metrics
+            .record_message_dedup_shard_budget(dedup_budget.entries(), dedup_budget.limit());
         let mut fatal: Option<FatalCommit> = None;
         for namespace in namespace_scratch.drain(..) {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
@@ -8613,6 +8625,26 @@ where
             if contradictions > 0 {
                 self.metrics
                     .record_partition_applied_log_contradictions(contradictions);
+            }
+            if partition.message_dedup_policy().is_some() {
+                partition.tick_message_dedup().await;
+                let dedup = partition.take_message_dedup_counters();
+                self.metrics.record_partition_message_dedup(
+                    &dedup_partition_label(namespace),
+                    &metrics::MessageDedupSample {
+                        dropped: dedup.dropped,
+                        dropped_in_flight: dedup.dropped_in_flight,
+                        awaited: dedup.awaited,
+                        evicted_budget: dedup.evicted_budget,
+                        deferred: dedup.deferred,
+                        missing_identity: dedup.missing_identity,
+                        unindexed: dedup.unindexed,
+                        evicted_live: dedup.evicted_live,
+                        unconfirmed_commits: dedup.unconfirmed_commits,
+                        entries: partition.message_dedup_len() as u64,
+                        allocated_bytes: partition.message_dedup_allocated_bytes() as u64,
+                    },
+                );
             }
             // A fenced partition must not tick: its consensus would emit
             // view-scoped sends for a log the cluster has already passed.
@@ -17719,5 +17751,14 @@ mod untrusted_do_view_change_tests {
                 group: GROUP,
             }
         ));
+    }
+}
+
+/// The per-partition dedup metric labels of `namespace`.
+fn dedup_partition_label(namespace: IggyNamespace) -> metrics::DedupPartitionLabel {
+    metrics::DedupPartitionLabel {
+        stream_id: namespace.stream_id() as u64,
+        topic_id: namespace.topic_id() as u64,
+        partition_id: namespace.partition_id() as u64,
     }
 }

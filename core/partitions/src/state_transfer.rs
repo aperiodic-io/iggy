@@ -3486,6 +3486,10 @@ where
                     ),
                     crate::PartitionIoVerdict::Ready => {
                         install.disposition = InstallDisposition::Mutating;
+                        // Whatever the outcome from here, the log the dedup
+                        // index described is gone: a success replaces it, a
+                        // failure drains it.
+                        self.clear_message_dedup_index();
                         self.cancel_history_maintenance();
                         self.invalidate_poll_history();
                         self.log.invalidate_sealed_read_state();
@@ -3630,6 +3634,12 @@ where
             InstallPhase::Done => {
                 if let (Some(persistence), Some(drain)) = (&self.persistence, &install.drain) {
                     persistence.finish_drain(drain);
+                }
+                if install.failure.is_none() {
+                    // An installed log arrives as segments, never as appends, so
+                    // the index is rebuilt from it; the repaired tail that follows
+                    // is folded by the append path as usual.
+                    self.rebuild_message_dedup_index().await;
                 }
                 let outcome = install.failure.take().map_or_else(
                     || {

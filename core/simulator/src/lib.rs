@@ -40,7 +40,7 @@ use executor::{DetExecutor, RunOutcome, TaskId};
 use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
 use iggy_binary_protocol::{
     Command, CommitHeader, DoViewChangeHeader, GenericHeader, PrepareHeader, ReplyHeader,
-    RequestHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader,
+    RequestHeader, RoutedRequestHeader, StartViewChangeHeader, StartViewHeader, WireOptions,
 };
 use iggy_common::{Durability, IggyError};
 use message_bus::MessageBus;
@@ -266,6 +266,9 @@ pub struct Simulator {
     consumer_offsets_max: usize,
     // The liveness fence directory survives replica restarts and is removed last.
     _system_directory: Option<tempfile::TempDir>,
+    /// Topic option blocks seeded with a namespace's topic, applied on first
+    /// materialisation and on every restart (see [`Self::set_topic_options`]).
+    topic_options: HashMap<IggyNamespace, WireOptions>,
 }
 
 impl Simulator {
@@ -610,7 +613,30 @@ impl Simulator {
             seed_root,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
             _system_directory: system_directory,
+            topic_options: HashMap::new(),
         }
+    }
+
+    /// Give `namespace`'s topic an explicit options block, as a real
+    /// `CreateTopic` would carry it (message deduplication, flush thresholds).
+    /// Must precede [`Self::init_partition`] for that namespace; restarts
+    /// re-apply it, as a rebooted server re-reads the committed topic.
+    pub fn set_topic_options(&mut self, namespace: IggyNamespace, options: WireOptions) {
+        self.topic_options.insert(namespace, options);
+    }
+
+    /// The options block a seed of `namespace` creates its topic with: the
+    /// block [`Self::set_topic_options`] registered, if any, with message and
+    /// consumer-offset durability set to `durability`.
+    fn seed_topic_options(&self, namespace: IggyNamespace, durability: Durability) -> WireOptions {
+        let mut options = self
+            .topic_options
+            .get(&namespace)
+            .map(iggy_common::TopicCreateOptions::parse_committed)
+            .unwrap_or_default();
+        options.durability = durability;
+        options.consumer_offset_durability = durability;
+        options.to_wire().expect("valid simulator topic options")
     }
 
     /// Configure the per-kind offset limit used by partitions materialised
@@ -667,6 +693,7 @@ impl Simulator {
             return;
         };
         let durability = self.partition_durability(namespace);
+        let seed_options = self.seed_topic_options(namespace, durability);
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
@@ -677,11 +704,11 @@ impl Simulator {
                     .seeded_namespaces
                     .borrow_mut()
                     .insert(namespace, (created_view, durability));
-                streams.seed_namespace_with_durability(
+                streams.seed_namespace_with_options(
                     namespace,
                     namespace.inner(),
                     created_view,
-                    durability,
+                    &seed_options,
                 );
             }
             materialise_partition(replica, namespace, self.consumer_offsets_max);
@@ -704,6 +731,7 @@ impl Simulator {
             return;
         };
         let durability = self.partition_durability(namespace);
+        let seed_options = self.seed_topic_options(namespace, durability);
         for (i, replica) in self.replicas.iter().enumerate() {
             if self.crashed.contains(&(i as u8)) {
                 continue;
@@ -719,11 +747,11 @@ impl Simulator {
                 .metadata()
                 .mux_stm
                 .streams()
-                .seed_namespace_with_durability(
+                .seed_namespace_with_options(
                     namespace,
                     namespace.inner(),
                     created_view,
-                    durability,
+                    &seed_options,
                 );
         }
     }
@@ -1534,7 +1562,13 @@ impl Simulator {
         let seeded_namespaces = self.replicas[idx].seeded_namespaces.borrow().clone();
         let seed_namespaces: Vec<_> = seeded_namespaces
             .iter()
-            .map(|(&namespace, &(view, durability))| (namespace, view, durability))
+            .map(|(&namespace, &(view, durability))| {
+                (
+                    namespace,
+                    view,
+                    self.seed_topic_options(namespace, durability),
+                )
+            })
             .collect();
         let mut materialized_namespaces: Vec<_> = partition_superblocks.keys().copied().collect();
         materialized_namespaces.sort_unstable();
@@ -2226,6 +2260,9 @@ mod slow_replica_tests;
 
 #[cfg(test)]
 mod stale_prepare_commit_tests;
+
+#[cfg(test)]
+mod message_dedup_tests;
 
 #[cfg(test)]
 mod tests {

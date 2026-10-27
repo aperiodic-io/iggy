@@ -1,0 +1,1750 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Per-partition message deduplication keyed on a message identity.
+//!
+//! A topic opts in with `dedup_window` plus an identity: a user header
+//! (`dedup_header`) or the message's own ID (`dedup_identity=message_id`).
+//! Within the window, the first message carrying a given identity is appended
+//! and later ones are dropped. This is content deduplication, separate from
+//! the `(client, request)` replay absorption in [`consensus::ClientTable`]: it
+//! also catches resends from a new session, a restarted producer, or a second
+//! producer publishing the same event.
+//!
+//! # Where decisions happen
+//!
+//! Only the partition primary decides, immediately before a request becomes
+//! a prepare. Dropped messages are removed from the batch there, so the
+//! decision is part of the replicated payload and backups apply it without
+//! consulting any index. A mixed-version or misconfigured group can therefore
+//! dedup less, but its logs can never fork.
+//!
+//! # Committed and pending
+//!
+//! The index has two halves. Committed keys are written only from committed
+//! content: every replica folds each op's batch as the commit walk passes
+//! it, and a rebuild reads committed storage back. Replicas at the same
+//! commit therefore hold the same committed keys, and a backup promoted by a
+//! view change decides exactly as its predecessor would have. Only a
+//! committed key inside the window ever drops a message.
+//!
+//! Pending keys are those of appended but uncommitted batches, from any
+//! append path (primary mint, backup receive, journal repair, WAL replay),
+//! tagged with the op that appended them and that prepare's checksum. A
+//! message matching one is not known to be a duplicate on its own: its
+//! original can still be truncated by a view change. But when the original is
+//! in flight in this primary's own pipeline (its op and checksum match a
+//! pipeline entry), the message is dropped all the same, because the request
+//! carrying it can only complete after that op: a partially duplicate request
+//! becomes a later prepare, and VSR commits in log order, so it never commits
+//! without its original, and a view change that truncates the original
+//! truncates it too. An all-duplicate request is answered only once the
+//! newest original it matched has committed, and refused transiently if this
+//! replica stops leading first. (Our Redpanda fork measured what refusing
+//! instead costs redundant producers: p99 49 ms against a 10 ms baseline.)
+//! A pending match that cannot be tied to a pipeline entry still refuses the
+//! whole request with `TransientNotCommitted`, so a pending key that outlives
+//! its log entry costs a retry, never a message: truncation rolls pending
+//! keys back, and when an op commits every pending key at or below it is
+//! swept, which also clears any a rollback path failed to report.
+//!
+//! # Time
+//!
+//! The window is measured on prepare timestamps only: an entry carries the
+//! prepare timestamp of the batch that appended it, and a request is screened
+//! against the timestamp its own prepare would get (the consensus' monotonic
+//! clock), so "inside the window" means "appended within W of the first
+//! occurrence" in the log's own time. Client-supplied timestamps never enter
+//! the index, and physical eviction follows the newest committed timestamp.
+//! (Our Redpanda fork lost dedup for good when one future-dated client
+//! timestamp pushed its eviction watermark past every entry.) The one use of a
+//! clock is the idle sweep: a partition that stops receiving keeps its newest
+//! timestamp, so its entries would never expire on their own, and the shard
+//! tick drops entries whose window ended before the consensus' monotonic
+//! clock. That clock never runs behind the timestamp the next prepare gets,
+//! so a swept entry is one no future request could match anyway: replicas may
+//! differ in which dead entries they still hold, never in a decision.
+//!
+//! # Memory
+//!
+//! A committed key costs one map slot (16-byte key, 16-byte entry, 1 control
+//! byte, at 44-87% load) plus one 24-byte eviction-queue item: about 60-100
+//! bytes. The cap, `[partition] message_dedup_entries_max`, bounds it; past
+//! the cap the oldest entries go first, even inside the window, and are
+//! counted as `evicted_live`: dedup never fails open for new keys.
+//!
+//! Shards balance partition counts, not index sizes, so per-partition caps
+//! alone let a few busy partitions on one shard add up to more memory than
+//! the node has (our Redpanda fork lost a broker that way). A shard-wide
+//! [`DedupBudget`], `[partition] message_dedup_entries_per_shard_max`, bounds
+//! the sum: at the budget the largest index on the shard gives up its oldest
+//! entries, counted as `evicted_budget`.
+//!
+//! Every eviction pass is bounded ([`EVICT_STEP_MAX`] entries), so a burst
+//! aging out of the window, or a lowered cap, is worked off across commits and
+//! ticks instead of stalling the shard's reactor in one go.
+
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::rc::{Rc, Weak};
+
+use iggy_binary_protocol::{WireUserHeaderIterator, validate_user_headers};
+use iggy_common::{DedupHeaderName, DedupIdentity, MessageDedupPolicy};
+use server_common::send_messages::{BatchIntegrity, BatchRef, decode_batch_slice_with};
+use twox_hash::XxHash3_128;
+
+/// Default cap on distinct keys held per partition: about 60-100 MiB for one
+/// partition at the cap (see the module docs).
+pub const DEFAULT_MESSAGE_DEDUP_ENTRIES_MAX: usize = 1_000_000;
+
+/// Most entries one eviction pass removes.
+///
+/// Leftover expiry or trimming is picked up by the next commit or idle
+/// sweep. About 4096 map removals is
+/// well under a millisecond, where draining a 6M-entry burst at once stalled
+/// our Redpanda fork's reactor for tens of milliseconds.
+pub const EVICT_STEP_MAX: usize = 4096;
+
+/// Entries the shard budget takes from the largest index per trim, so the
+/// scan for the largest is amortised over many inserts.
+const BUDGET_TRIM_BATCH: usize = 64;
+
+/// The identity of one message under a topic's dedup policy.
+///
+/// A 128-bit hash of the configured header's value kind and bytes, or of the
+/// message ID. Two distinct identities collide with probability ~2^-128 per
+/// pair. Stored as two `u64` halves so map slots align to 8 bytes, not 16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DedupKey([u64; 2]);
+
+impl std::hash::Hash for DedupKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The halves of a uniform hash are uniform: no need to hash a hash.
+        state.write_u64(self.0[0]);
+    }
+}
+
+impl DedupKey {
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub const fn from_raw(raw: u128) -> Self {
+        Self([raw as u64, (raw >> 64) as u64])
+    }
+
+    #[must_use]
+    pub const fn as_raw(self) -> u128 {
+        (self.0[1] as u128) << 64 | self.0[0] as u128
+    }
+}
+
+/// Extract the dedup key of one message from its raw user-header block.
+///
+/// `None` when the block is malformed or does not carry `header`. The block
+/// is validated before it is walked because the send path does not validate
+/// user headers and the TLV iterator panics on garbage.
+#[must_use]
+pub fn dedup_key(user_headers: &[u8], header: &DedupHeaderName) -> Option<DedupKey> {
+    if user_headers.is_empty() || validate_user_headers(user_headers).is_err() {
+        return None;
+    }
+    WireUserHeaderIterator::new(user_headers)
+        .find(|entry| entry.key == header.as_bytes())
+        // One pass with the kind as the seed: the streaming hasher allocates
+        // its secret and zeroes a buffer per message, which our Redpanda fork
+        // measured as the bulk of identity cost. Digests are never persisted
+        // (every replica rebuilds its index from the log), so the function
+        // may change between versions.
+        .map(|entry| {
+            DedupKey::from_raw(XxHash3_128::oneshot_with_seed(
+                u64::from(entry.value_kind.0),
+                entry.value,
+            ))
+        })
+}
+
+/// The key of a message ID. Hashed rather than used as is, so IDs that are
+/// not uniformly distributed (a counter) still spread across the map.
+#[must_use]
+pub fn message_id_key(id: u128) -> DedupKey {
+    DedupKey::from_raw(XxHash3_128::oneshot(&id.to_le_bytes()))
+}
+
+/// What a message's identity is under a topic's policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageIdentity {
+    Key(DedupKey),
+    /// ID mode, ID 0: no identity, admitted and never indexed.
+    Unindexed,
+    /// Header mode, header absent or the header block malformed: the request
+    /// carrying it is refused.
+    Missing,
+}
+
+#[must_use]
+pub fn message_identity(
+    identity: &DedupIdentity,
+    id: u128,
+    user_headers: &[u8],
+) -> MessageIdentity {
+    match identity {
+        DedupIdentity::MessageId if id == 0 => MessageIdentity::Unindexed,
+        DedupIdentity::MessageId => MessageIdentity::Key(message_id_key(id)),
+        DedupIdentity::Header(header) => {
+            dedup_key(user_headers, header).map_or(MessageIdentity::Missing, MessageIdentity::Key)
+        }
+    }
+}
+
+/// One indexed committed occurrence of a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupEntry {
+    /// Absolute offset of the message holding the key. Also the eviction
+    /// queue's staleness token: a committed offset is never reused.
+    pub offset: u64,
+    /// Prepare timestamp of the batch that appended it, in microseconds.
+    pub timestamp: u64,
+}
+
+/// One appended, uncommitted occurrence of a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PendingEntry {
+    pub offset: u64,
+    pub timestamp: u64,
+    /// Op that appended it.
+    pub op: u64,
+    /// Checksum of that op's prepare, which ties the entry to one log entry:
+    /// the same op number in another view can hold other content.
+    pub checksum: u128,
+    seq: u64,
+}
+
+/// Counters a partition drains into shard metrics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DedupCounters {
+    /// Messages removed from requests because their key was committed and
+    /// inside the window.
+    pub dropped: u64,
+    /// Messages removed from requests because their key was in flight in
+    /// this primary's pipeline.
+    pub dropped_in_flight: u64,
+    /// All-duplicate requests answered only once the originals they matched
+    /// committed.
+    pub awaited: u64,
+    /// Requests refused transiently because a key matched an uncommitted
+    /// occurrence.
+    pub deferred: u64,
+    /// Requests refused because a message lacked the topic's dedup header.
+    pub missing_identity: u64,
+    /// Messages admitted without an identity (ID mode, ID 0).
+    pub unindexed: u64,
+    /// Committed entries evicted by the entry cap while still inside the
+    /// window.
+    pub evicted_live: u64,
+    /// Committed entries the shard budget took while still inside the window.
+    pub evicted_budget: u64,
+    /// Committed ops whose batch could not be read back at commit, so their
+    /// keys were not indexed.
+    pub unconfirmed_commits: u64,
+}
+
+/// How a key matched the index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupMatch {
+    /// A committed occurrence inside the window: the message is a duplicate.
+    Committed,
+    /// An appended occurrence that is not committed yet, at `op` with prepare
+    /// `checksum`: whether the message is a duplicate is not known until it
+    /// commits or is truncated.
+    Uncommitted { op: u64, checksum: u128 },
+}
+
+type KeyMap<V> = HashMap<DedupKey, V, BuildHasherDefault<KeyHasher>>;
+
+/// The shard-wide budget for committed dedup entries.
+///
+/// Counts what every deduplicating partition of one shard holds, against
+/// `[partition] message_dedup_entries_per_shard_max`; see the module docs. One
+/// per shard, shared by its partitions' indexes. A limit of 0 turns it off.
+#[derive(Debug, Default)]
+pub struct DedupBudget {
+    entries: Cell<usize>,
+    limit: Cell<usize>,
+    members: RefCell<Vec<Weak<RefCell<MessageDedupIndex>>>>,
+}
+
+impl DedupBudget {
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit: Cell::new(limit),
+            ..Self::default()
+        }
+    }
+
+    /// Change the limit. A lower one is worked off by later inserts, a bounded
+    /// trim at a time.
+    pub fn set_limit(&self, limit: usize) {
+        self.limit.set(limit);
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> usize {
+        self.limit.get()
+    }
+
+    /// Committed entries held across the shard.
+    #[must_use]
+    pub const fn entries(&self) -> usize {
+        self.entries.get()
+    }
+
+    /// Count `index`'s entries against this budget and let it be trimmed for
+    /// another member's inserts.
+    pub fn register(self: &Rc<Self>, index: &Rc<RefCell<MessageDedupIndex>>) {
+        let mut members = self.members.borrow_mut();
+        members.retain(|member| member.strong_count() > 0);
+        members.push(Rc::downgrade(index));
+        drop(members);
+        index.borrow_mut().attach_budget(Rc::clone(self));
+    }
+
+    const fn over_by(&self) -> usize {
+        match self.limit.get() {
+            0 => 0,
+            limit => self.entries.get().saturating_sub(limit),
+        }
+    }
+
+    /// The member holding the most entries among those not borrowed right
+    /// now, so never the index asking: it is mutably borrowed.
+    fn largest_available(&self) -> Option<(Rc<RefCell<MessageDedupIndex>>, usize)> {
+        self.members
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter_map(|member| {
+                let len = member.try_borrow().ok()?.len();
+                Some((member, len))
+            })
+            .max_by_key(|(_, len)| *len)
+    }
+}
+
+/// The per-partition dedup index. See the module docs for its invariants.
+///
+/// Two halves. `committed` holds keys of committed messages and is written
+/// only from committed content (the commit walk and a rebuild from committed
+/// storage), so replicas at the same commit hold the same set and only it
+/// ever justifies dropping a message. `pending` holds keys appended but not
+/// yet committed, tagged with their op, and only ever defers a request: it is
+/// rolled back by truncation and swept when its op commits, which also
+/// removes any occurrence a rollback path failed to report.
+#[derive(Debug)]
+pub struct MessageDedupIndex {
+    committed: KeyMap<DedupEntry>,
+    /// Insertion order of `committed` as `(offset, key)`, for eviction. An
+    /// item whose offset no longer matches the live entry is stale and
+    /// skipped.
+    order: VecDeque<(u64, DedupKey)>,
+    pending: KeyMap<PendingEntry>,
+    pending_by_op: BTreeMap<u64, Vec<(DedupKey, u64)>>,
+    next_seq: u64,
+    /// Newest committed timestamp folded in. Physical eviction is measured
+    /// against it, never against a local clock.
+    newest_timestamp: u64,
+    /// The window the last fold or sweep used, so a trim the shard budget
+    /// asks for can tell a live entry from an expired one.
+    window_micros: u64,
+    entries_max: usize,
+    budget: Option<Rc<DedupBudget>>,
+    /// Committed entries currently counted against `budget`.
+    accounted: usize,
+    counters: DedupCounters,
+}
+
+impl Drop for MessageDedupIndex {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget
+                .entries
+                .set(budget.entries.get().saturating_sub(self.accounted));
+        }
+    }
+}
+
+impl MessageDedupIndex {
+    #[must_use]
+    pub fn new(entries_max: usize) -> Self {
+        Self {
+            committed: KeyMap::default(),
+            order: VecDeque::new(),
+            pending: KeyMap::default(),
+            pending_by_op: BTreeMap::new(),
+            next_seq: 0,
+            newest_timestamp: 0,
+            window_micros: 0,
+            entries_max: entries_max.max(1),
+            budget: None,
+            accounted: 0,
+            counters: DedupCounters::default(),
+        }
+    }
+
+    fn attach_budget(&mut self, budget: Rc<DedupBudget>) {
+        if let Some(previous) = self.budget.take() {
+            previous
+                .entries
+                .set(previous.entries.get().saturating_sub(self.accounted));
+        }
+        self.accounted = 0;
+        self.budget = Some(budget);
+        self.sync_budget();
+    }
+
+    /// Bring the shard budget's count of this index up to date.
+    fn sync_budget(&mut self) {
+        let Some(budget) = &self.budget else {
+            return;
+        };
+        let len = self.committed.len();
+        budget
+            .entries
+            .set(budget.entries.get().saturating_sub(self.accounted) + len);
+        self.accounted = len;
+    }
+
+    /// Committed keys held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.committed.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.committed.is_empty()
+    }
+
+    /// Uncommitted keys held.
+    #[must_use]
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[must_use]
+    pub const fn entries_max(&self) -> usize {
+        self.entries_max
+    }
+
+    /// Bytes the index's tables hold allocated, live or not: map slots plus
+    /// one control byte each, and the eviction queue. An estimate of the
+    /// heap it pins, for the `index_bytes` gauge.
+    #[must_use]
+    pub fn allocated_bytes(&self) -> usize {
+        const COMMITTED_SLOT: usize = size_of::<(DedupKey, DedupEntry)>() + 1;
+        const PENDING_SLOT: usize = size_of::<(DedupKey, PendingEntry)>() + 1;
+        self.committed.capacity() * COMMITTED_SLOT
+            + self.order.capacity() * size_of::<(u64, DedupKey)>()
+            + self.pending.capacity() * PENDING_SLOT
+    }
+
+    /// Change the cap. A lower one is worked off a bounded pass at a time,
+    /// by later commits and idle sweeps.
+    pub fn set_entries_max(&mut self, entries_max: usize, window_micros: u64) {
+        self.entries_max = entries_max.max(1);
+        self.evict(window_micros);
+    }
+
+    /// Make room for `additional` committed keys in one step, up to the cap,
+    /// instead of doubling through every size on the way.
+    pub fn reserve(&mut self, additional: usize) {
+        let target = (self.committed.len() + additional).min(self.entries_max);
+        self.committed
+            .reserve(target.saturating_sub(self.committed.len()));
+        self.order.reserve(target.saturating_sub(self.order.len()));
+    }
+
+    #[must_use]
+    pub fn committed_entry(&self, key: DedupKey) -> Option<&DedupEntry> {
+        self.committed.get(&key)
+    }
+
+    #[must_use]
+    pub fn pending_entry(&self, key: DedupKey) -> Option<&PendingEntry> {
+        self.pending.get(&key)
+    }
+
+    /// How `key` matches as of `now`, the timestamp the screened request's
+    /// own prepare would get: a committed occurrence inside the window, else
+    /// an uncommitted occurrence above `commit_op`.
+    ///
+    /// A pending occurrence at or below `commit_op` can no longer commit: its
+    /// op already did, with content the commit walk has either indexed or
+    /// could not read. It is ignored rather than trusted either way. Treating
+    /// it as uncommitted would defer the key until a later commit sweeps it,
+    /// and when every request in flight carries such a key nothing commits,
+    /// so nothing would ever sweep it.
+    #[must_use]
+    pub fn lookup(
+        &self,
+        key: DedupKey,
+        now: u64,
+        window_micros: u64,
+        commit_op: u64,
+    ) -> Option<DedupMatch> {
+        if self
+            .committed
+            .get(&key)
+            .is_some_and(|entry| entry.timestamp.saturating_add(window_micros) > now)
+        {
+            return Some(DedupMatch::Committed);
+        }
+        self.pending
+            .get(&key)
+            .filter(|entry| entry.op > commit_op)
+            .map(|entry| DedupMatch::Uncommitted {
+                op: entry.op,
+                checksum: entry.checksum,
+            })
+    }
+
+    /// Note an appended, uncommitted occurrence of `key`.
+    ///
+    /// Re-recording the same op updates the entry in place: the primary
+    /// records at admission with a provisional offset, then again at append
+    /// with the stamped one.
+    pub fn record_pending(
+        &mut self,
+        key: DedupKey,
+        offset: u64,
+        timestamp: u64,
+        op: u64,
+        checksum: u128,
+    ) {
+        if let Some(existing) = self.pending.get_mut(&key)
+            && existing.op == op
+        {
+            existing.offset = offset;
+            existing.timestamp = timestamp;
+            existing.checksum = checksum;
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.pending.insert(
+            key,
+            PendingEntry {
+                offset,
+                timestamp,
+                op,
+                checksum,
+                seq,
+            },
+        );
+        self.pending_by_op.entry(op).or_default().push((key, seq));
+    }
+
+    /// Index a committed occurrence of `key`. Only committed content may
+    /// reach this: the commit walk, or a rebuild from committed storage.
+    /// Idempotent: re-folding the same occurrence (rebuild overlapping the
+    /// commit walk or WAL replay) changes nothing.
+    pub fn record_committed(
+        &mut self,
+        key: DedupKey,
+        offset: u64,
+        timestamp: u64,
+        window_micros: u64,
+    ) {
+        self.newest_timestamp = self.newest_timestamp.max(timestamp);
+        if self
+            .committed
+            .get(&key)
+            .is_some_and(|existing| existing.offset == offset)
+        {
+            return;
+        }
+        self.committed.insert(key, DedupEntry { offset, timestamp });
+        self.order.push_back((offset, key));
+        self.evict(window_micros);
+        self.enforce_budget();
+    }
+
+    /// `op` committed: drop every uncommitted occurrence at or below it. The
+    /// committed ones were just indexed from the committed content, so what is
+    /// left is either that same content (now redundant) or an occurrence from
+    /// a log suffix this replica lost without a reported truncation.
+    pub fn sweep_committed_through(&mut self, op: u64) {
+        let remaining = self.pending_by_op.split_off(&(op + 1));
+        let swept = std::mem::replace(&mut self.pending_by_op, remaining);
+        for (key, seq) in swept.into_values().flatten() {
+            if self.pending.get(&key).is_some_and(|entry| entry.seq == seq) {
+                self.pending.remove(&key);
+            }
+        }
+    }
+
+    /// Forget every uncommitted occurrence appended by `from_op` or later,
+    /// mirroring a truncation of the uncommitted log suffix. Committed
+    /// entries are never truncated.
+    pub fn truncate_from_op(&mut self, from_op: u64) {
+        let truncated = self.pending_by_op.split_off(&from_op);
+        for (key, seq) in truncated.into_values().flatten() {
+            if self.pending.get(&key).is_some_and(|entry| entry.seq == seq) {
+                self.pending.remove(&key);
+            }
+        }
+    }
+
+    /// Drop every entry and give the tables' memory back. Counters survive:
+    /// they belong to the metrics, not to the index contents.
+    pub fn clear(&mut self) {
+        self.committed = KeyMap::default();
+        self.order = VecDeque::new();
+        self.pending = KeyMap::default();
+        self.pending_by_op = BTreeMap::new();
+        self.newest_timestamp = 0;
+        self.sync_budget();
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> DedupCounters {
+        self.counters
+    }
+
+    /// Return the counters accumulated since the last call and reset them.
+    pub fn take_counters(&mut self) -> DedupCounters {
+        std::mem::take(&mut self.counters)
+    }
+
+    pub const fn note_dropped(&mut self, dropped: u64) {
+        self.counters.dropped = self.counters.dropped.saturating_add(dropped);
+    }
+
+    pub const fn note_dropped_in_flight(&mut self, dropped: u64) {
+        self.counters.dropped_in_flight = self.counters.dropped_in_flight.saturating_add(dropped);
+    }
+
+    pub const fn note_awaited(&mut self) {
+        self.counters.awaited = self.counters.awaited.saturating_add(1);
+    }
+
+    pub const fn note_deferred(&mut self) {
+        self.counters.deferred = self.counters.deferred.saturating_add(1);
+    }
+
+    pub const fn note_missing_identity(&mut self) {
+        self.counters.missing_identity = self.counters.missing_identity.saturating_add(1);
+    }
+
+    pub const fn note_unindexed(&mut self, unindexed: u64) {
+        self.counters.unindexed = self.counters.unindexed.saturating_add(unindexed);
+    }
+
+    pub const fn note_unconfirmed_commit(&mut self) {
+        self.counters.unconfirmed_commits = self.counters.unconfirmed_commits.saturating_add(1);
+    }
+
+    /// Order-independent digest of the committed keys (key, offset,
+    /// timestamp). Replicas at the same commit hold the same committed set.
+    #[must_use]
+    pub fn fingerprint(&self) -> u128 {
+        let mut hasher = XxHash3_128::new();
+        for (key, offset, timestamp) in self.entries_sorted() {
+            hasher.write(&key.to_le_bytes());
+            hasher.write(&offset.to_le_bytes());
+            hasher.write(&timestamp.to_le_bytes());
+        }
+        hasher.finish_128()
+    }
+
+    /// [`Self::fingerprint`] over the entries still live as of `now`: those a
+    /// request screened at `now` could match. Replicas at the same commit
+    /// agree on it even when their idle sweeps ran at different times, since
+    /// a sweep only drops entries whose window ended before its own clock.
+    #[must_use]
+    pub fn fingerprint_live(&self, now: u64, window_micros: u64) -> u128 {
+        let mut hasher = XxHash3_128::new();
+        for (key, offset, timestamp) in self
+            .entries_sorted()
+            .into_iter()
+            .filter(|(_, _, timestamp)| timestamp.saturating_add(window_micros) > now)
+        {
+            hasher.write(&key.to_le_bytes());
+            hasher.write(&offset.to_le_bytes());
+            hasher.write(&timestamp.to_le_bytes());
+        }
+        hasher.finish_128()
+    }
+
+    /// Drop entries whose window ended before `now`, the consensus clock, so
+    /// a partition that stopped receiving gives its memory back. Bounded like
+    /// every eviction pass; returns the entries removed.
+    pub fn expire_idle(&mut self, now: u64, window_micros: u64) -> usize {
+        let before = self.committed.len();
+        self.window_micros = window_micros;
+        // Live while `timestamp + window > now`, as `lookup` reads it.
+        let clock_cutoff = now
+            .checked_sub(window_micros)
+            .map_or(0, |dead_through| dead_through.saturating_add(1));
+        let cutoff = clock_cutoff.max(self.newest_timestamp.saturating_sub(window_micros));
+        self.evict_through(cutoff);
+        before.saturating_sub(self.committed.len())
+    }
+
+    /// Committed entries as `(key, offset, timestamp)`, sorted.
+    /// Diagnostics only.
+    #[must_use]
+    pub fn entries_sorted(&self) -> Vec<(u128, u64, u64)> {
+        let mut items: Vec<(u128, u64, u64)> = self
+            .committed
+            .iter()
+            .map(|(key, entry)| (key.as_raw(), entry.offset, entry.timestamp))
+            .collect();
+        items.sort_unstable();
+        items
+    }
+
+    fn evict(&mut self, window_micros: u64) {
+        self.window_micros = window_micros;
+        self.evict_through(self.newest_timestamp.saturating_sub(window_micros));
+    }
+
+    /// Remove entries older than `cutoff`, then the oldest past the cap, at
+    /// most [`EVICT_STEP_MAX`] in all: leftovers wait for the next pass.
+    fn evict_through(&mut self, cutoff: u64) {
+        let mut steps = EVICT_STEP_MAX;
+        while steps > 0
+            && let Some(&(offset, key)) = self.order.front()
+        {
+            match self.committed.get(&key) {
+                Some(entry) if entry.offset == offset => {
+                    if entry.timestamp >= cutoff {
+                        break;
+                    }
+                    self.committed.remove(&key);
+                    self.order.pop_front();
+                }
+                _ => {
+                    self.order.pop_front();
+                }
+            }
+            steps -= 1;
+        }
+        while steps > 0 && self.committed.len() > self.entries_max {
+            let Some((offset, key)) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.committed.get(&key)
+                && entry.offset == offset
+            {
+                if entry.timestamp >= cutoff {
+                    self.counters.evicted_live = self.counters.evicted_live.saturating_add(1);
+                }
+                self.committed.remove(&key);
+            }
+            steps -= 1;
+        }
+        self.compact_order_if_sparse();
+        self.sync_budget();
+    }
+
+    /// Past the shard budget, trim the largest index on the shard: this one,
+    /// or the largest other member if that holds more. Takes a batch past the
+    /// excess so the scan for the largest is paid once per batch of inserts.
+    fn enforce_budget(&mut self) {
+        let Some(budget) = self.budget.clone() else {
+            return;
+        };
+        let over = budget.over_by();
+        if over == 0 {
+            return;
+        }
+        let take = over.saturating_add(BUDGET_TRIM_BATCH).min(EVICT_STEP_MAX);
+        if let Some((other, other_len)) = budget.largest_available()
+            && other_len > self.committed.len()
+            && let Ok(mut other) = other.try_borrow_mut()
+        {
+            other.trim_for_budget(take);
+            return;
+        }
+        self.trim_for_budget(take);
+    }
+
+    /// Remove the `count` oldest entries for the shard budget.
+    fn trim_for_budget(&mut self, count: usize) {
+        let cutoff = self.newest_timestamp.saturating_sub(self.window_micros);
+        let mut removed = 0;
+        while removed < count {
+            let Some((offset, key)) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(entry) = self.committed.get(&key)
+                && entry.offset == offset
+            {
+                if entry.timestamp >= cutoff {
+                    self.counters.evicted_budget = self.counters.evicted_budget.saturating_add(1);
+                }
+                self.committed.remove(&key);
+                removed += 1;
+            }
+        }
+        self.compact_order_if_sparse();
+        self.sync_budget();
+    }
+
+    /// Stale queue items are left behind by replacement. Keep them from
+    /// outgrowing the live entries so memory stays proportional to the index,
+    /// not to its history.
+    fn compact_order_if_sparse(&mut self) {
+        if self.order.len() <= 64 || self.order.len() <= self.committed.len().saturating_mul(2) {
+            return;
+        }
+        let committed = &self.committed;
+        self.order.retain(|(offset, key)| {
+            committed
+                .get(key)
+                .is_some_and(|entry| entry.offset == *offset)
+        });
+    }
+}
+
+/// What the primary should do with one `SendMessages` request.
+#[derive(Debug, PartialEq, Eq)]
+pub struct BatchVerdict {
+    /// Per message, whether it is kept.
+    pub keep: Vec<bool>,
+    /// Keys of the kept messages, in kept order (`None` for a kept message
+    /// without an identity).
+    pub kept_keys: Vec<Option<DedupKey>>,
+    /// Messages dropped: committed duplicates, and repeats earlier in the
+    /// same batch.
+    pub dropped: u64,
+    /// Messages dropped because their original is in flight in this
+    /// primary's pipeline.
+    pub dropped_in_flight: u64,
+    /// The newest in-flight op a dropped message matched: the request may
+    /// complete only once it has committed.
+    pub wait_for_op: Option<u64>,
+    /// Kept messages without an identity (ID mode, ID 0).
+    pub unindexed: u64,
+    /// Whether any message matched an uncommitted occurrence that is not in
+    /// flight in this primary's pipeline. Such a request is refused
+    /// transiently as a whole, never filtered.
+    pub matched_uncommitted: bool,
+    /// Whether any message lacked the topic's dedup header. Such a request is
+    /// refused as a whole.
+    pub missing_identity: bool,
+}
+
+impl BatchVerdict {
+    #[must_use]
+    pub const fn keeps_all(&self) -> bool {
+        self.dropped == 0 && self.dropped_in_flight == 0
+    }
+
+    #[must_use]
+    pub const fn keeps_none(&self) -> bool {
+        self.kept_keys.is_empty()
+    }
+}
+
+/// Decide which messages of `batch` are duplicates.
+///
+/// A message is dropped when its key has a committed occurrence inside the
+/// window as of `now`, when an earlier message of the same batch carried the
+/// same key (first wins), or when its key matches an uncommitted occurrence
+/// that `in_flight(op, checksum)` confirms is in this primary's pipeline (see
+/// the module docs). Any other uncommitted match, or a message without its
+/// header, is only flagged: the caller refuses the whole request.
+#[must_use]
+pub fn classify_batch(
+    batch: &BatchRef<'_>,
+    policy: &MessageDedupPolicy,
+    index: &MessageDedupIndex,
+    now: u64,
+    commit_op: u64,
+    in_flight: impl Fn(u64, u128) -> bool,
+) -> BatchVerdict {
+    let window = policy.window_micros();
+    let count = batch.header.message_count as usize;
+    let mut verdict = BatchVerdict {
+        keep: Vec::with_capacity(count),
+        kept_keys: Vec::with_capacity(count),
+        dropped: 0,
+        dropped_in_flight: 0,
+        wait_for_op: None,
+        unindexed: 0,
+        matched_uncommitted: false,
+        missing_identity: false,
+    };
+    let mut seen_in_batch: HashSet<DedupKey, BuildHasherDefault<KeyHasher>> = HashSet::default();
+    for view in batch {
+        let key = match message_identity(&policy.identity, view.header.id, view.user_headers) {
+            MessageIdentity::Key(key) => key,
+            MessageIdentity::Unindexed => {
+                verdict.unindexed += 1;
+                verdict.keep.push(true);
+                verdict.kept_keys.push(None);
+                continue;
+            }
+            MessageIdentity::Missing => {
+                verdict.missing_identity = true;
+                verdict.keep.push(true);
+                verdict.kept_keys.push(None);
+                continue;
+            }
+        };
+        if seen_in_batch.contains(&key) {
+            verdict.keep.push(false);
+            verdict.dropped += 1;
+            continue;
+        }
+        match index.lookup(key, now, window, commit_op) {
+            Some(DedupMatch::Committed) => {
+                verdict.keep.push(false);
+                verdict.dropped += 1;
+                continue;
+            }
+            Some(DedupMatch::Uncommitted { op, checksum }) if in_flight(op, checksum) => {
+                verdict.keep.push(false);
+                verdict.dropped_in_flight += 1;
+                verdict.wait_for_op = Some(verdict.wait_for_op.map_or(op, |wait| wait.max(op)));
+                continue;
+            }
+            Some(DedupMatch::Uncommitted { .. }) => verdict.matched_uncommitted = true,
+            None => {}
+        }
+        seen_in_batch.insert(key);
+        verdict.keep.push(true);
+        verdict.kept_keys.push(Some(key));
+    }
+    verdict
+}
+
+/// Keys of an appended, stamped batch record (`[batch header][frames]`) with
+/// their absolute offsets and the batch timestamp, as every replica reads
+/// them from the same stamped bytes.
+#[must_use]
+pub fn stamped_batch_keys(policy: &MessageDedupPolicy, body: &[u8]) -> Vec<(DedupKey, u64, u64)> {
+    let Ok(batch) = decode_batch_slice_with(body, BatchIntegrity::LayoutOnly) else {
+        return Vec::new();
+    };
+    let base_offset = batch.header.base_offset;
+    let timestamp = batch.header.base_timestamp;
+    batch
+        .iter()
+        .filter_map(|view| {
+            match message_identity(&policy.identity, view.header.id, view.user_headers) {
+                MessageIdentity::Key(key) => Some((
+                    key,
+                    base_offset + u64::from(view.header.offset_delta),
+                    timestamp,
+                )),
+                MessageIdentity::Unindexed | MessageIdentity::Missing => None,
+            }
+        })
+        .collect()
+}
+
+/// Fold an appended, uncommitted batch into the pending half.
+pub fn record_pending_batch(
+    index: &mut MessageDedupIndex,
+    policy: &MessageDedupPolicy,
+    body: &[u8],
+    op: u64,
+    checksum: u128,
+) {
+    for (key, offset, timestamp) in stamped_batch_keys(policy, body) {
+        index.record_pending(key, offset, timestamp, op, checksum);
+    }
+}
+
+/// Fold a committed batch into the committed half and sweep the pending
+/// occurrences it supersedes.
+pub fn record_committed_batch(
+    index: &mut MessageDedupIndex,
+    policy: &MessageDedupPolicy,
+    body: &[u8],
+    op: u64,
+) {
+    let window = policy.window_micros();
+    for (key, offset, timestamp) in stamped_batch_keys(policy, body) {
+        index.record_committed(key, offset, timestamp, window);
+    }
+    index.sweep_committed_through(op);
+}
+
+/// Keys are already uniformly distributed hashes; feed their low 64 bits to
+/// the map directly instead of hashing a hash.
+#[derive(Default)]
+struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = self.0.rotate_left(8) ^ u64::from(*byte);
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
+mod tests {
+    use std::str::FromStr;
+
+    use bytes::BytesMut;
+    use iggy_binary_protocol::encode_user_headers;
+    use iggy_common::IggyDuration;
+
+    use super::*;
+
+    const WINDOW: u64 = 1_000;
+    const STRING_KIND: u8 = 2;
+    const RAW_KIND: u8 = 1;
+
+    fn key(value: u128) -> DedupKey {
+        DedupKey::from_raw(value)
+    }
+
+    fn policy(header: &str) -> MessageDedupPolicy {
+        MessageDedupPolicy {
+            window: IggyDuration::from(WINDOW),
+            identity: DedupIdentity::Header(DedupHeaderName::from_str(header).unwrap()),
+        }
+    }
+
+    fn id_policy() -> MessageDedupPolicy {
+        MessageDedupPolicy {
+            window: IggyDuration::from(WINDOW),
+            identity: DedupIdentity::MessageId,
+        }
+    }
+
+    fn headers(entries: &[(&str, u8, &[u8])]) -> Vec<u8> {
+        let encoded: Vec<(u8, &[u8], u8, &[u8])> = entries
+            .iter()
+            .map(|(name, kind, value)| (STRING_KIND, name.as_bytes(), *kind, *value))
+            .collect();
+        let mut buffer = BytesMut::new();
+        encode_user_headers(&encoded, &mut buffer);
+        buffer.to_vec()
+    }
+
+    #[test]
+    fn key_is_read_from_the_configured_header_only() {
+        let block = headers(&[
+            ("trace", STRING_KIND, b"t-1"),
+            ("dedup-key", STRING_KIND, b"evt-1"),
+        ]);
+        let name = DedupHeaderName::from_str("dedup-key").unwrap();
+        let found = dedup_key(&block, &name).expect("header present");
+        let other = headers(&[("dedup-key", STRING_KIND, b"evt-2")]);
+        assert_ne!(Some(found), dedup_key(&other, &name));
+        // Same value under another header name is a different policy's key.
+        let trace = DedupHeaderName::from_str("trace").unwrap();
+        assert_ne!(dedup_key(&block, &trace), Some(found));
+    }
+
+    #[test]
+    fn same_value_is_the_same_key_across_batches_and_header_order() {
+        let name = DedupHeaderName::from_str("dedup-key").unwrap();
+        let first = headers(&[("a", STRING_KIND, b"x"), ("dedup-key", STRING_KIND, b"evt")]);
+        let second = headers(&[("dedup-key", STRING_KIND, b"evt"), ("b", STRING_KIND, b"y")]);
+        assert_eq!(dedup_key(&first, &name), dedup_key(&second, &name));
+    }
+
+    #[test]
+    fn value_kind_is_part_of_the_identity() {
+        // `evt` as a string and as raw bytes are different typed values; a
+        // producer that switches encodings mid-stream is not deduplicated
+        // against itself, which is documented rather than guessed at.
+        let name = DedupHeaderName::from_str("dedup-key").unwrap();
+        let as_string = headers(&[("dedup-key", STRING_KIND, b"evt")]);
+        let as_raw = headers(&[("dedup-key", RAW_KIND, b"evt")]);
+        assert_ne!(dedup_key(&as_string, &name), dedup_key(&as_raw, &name));
+    }
+
+    #[test]
+    fn missing_empty_or_malformed_headers_yield_no_key_and_never_panic() {
+        let name = DedupHeaderName::from_str("dedup-key").unwrap();
+        assert_eq!(dedup_key(&[], &name), None);
+        assert_eq!(
+            dedup_key(&headers(&[("other", STRING_KIND, b"v")]), &name),
+            None
+        );
+        // Truncated, zero kind, overlong length, odd TLV count.
+        let mut garbage: Vec<Vec<u8>> = vec![vec![2, 9, 0, 0, 0, b'd'], vec![0; 12]];
+        let mut odd = headers(&[("dedup-key", STRING_KIND, b"evt")]);
+        odd.truncate(odd.len() - 1);
+        garbage.push(odd);
+        garbage.push(vec![2, 0xff, 0xff, 0xff, 0x7f]);
+        for block in garbage {
+            assert_eq!(dedup_key(&block, &name), None, "{block:?}");
+        }
+    }
+
+    #[test]
+    fn committed_keys_match_inside_the_window_only() {
+        let mut index = MessageDedupIndex::new(16);
+        index.record_committed(key(1), 10, 5_000, WINDOW);
+        assert_eq!(
+            index.lookup(key(1), 5_999, WINDOW, 0),
+            Some(DedupMatch::Committed)
+        );
+        assert_eq!(
+            index.lookup(key(1), 6_000, WINDOW, 0),
+            None,
+            "window is half-open"
+        );
+        assert_eq!(index.lookup(key(2), 5_000, WINDOW, 0), None);
+    }
+
+    #[test]
+    fn pending_keys_only_ever_defer() {
+        let mut index = MessageDedupIndex::new(16);
+        index.record_pending(key(1), 0, 5_000, 7, 0xc7);
+        assert_eq!(
+            index.lookup(key(1), 5_000, WINDOW, 0),
+            Some(DedupMatch::Uncommitted {
+                op: 7,
+                checksum: 0xc7
+            })
+        );
+        // A committed occurrence outranks a pending one of the same key.
+        index.record_committed(key(1), 0, 5_000, WINDOW);
+        assert_eq!(
+            index.lookup(key(1), 5_000, WINDOW, 0),
+            Some(DedupMatch::Committed)
+        );
+    }
+
+    #[test]
+    fn commit_sweeps_pending_keys_at_or_below_its_op_including_unreported_ones() {
+        // Op 4 appended key 1 on this replica, but a view change replaced op 4
+        // without this replica hearing of the truncation. When the canonical
+        // op 4 (key 2) commits, key 1's stale occurrence must go: left behind,
+        // it would defer every retry of an event that never committed.
+        let mut index = MessageDedupIndex::new(16);
+        index.record_pending(key(1), 10, 1_000, 4, 0);
+        index.record_pending(key(3), 11, 1_000, 5, 0);
+        index.record_committed(key(2), 10, 1_100, WINDOW);
+        index.sweep_committed_through(4);
+        assert_eq!(index.lookup(key(1), 1_100, WINDOW, 0), None);
+        assert_eq!(
+            index.lookup(key(2), 1_100, WINDOW, 0),
+            Some(DedupMatch::Committed)
+        );
+        assert_eq!(
+            index.lookup(key(3), 1_100, WINDOW, 0),
+            Some(DedupMatch::Uncommitted { op: 5, checksum: 0 })
+        );
+    }
+
+    #[test]
+    fn a_pending_key_at_or_below_the_commit_point_is_ignored_not_deferred() {
+        // Replayed at boot for an op that already committed, and never swept
+        // because nothing has committed since. Deferring on it would block
+        // the very commits that would sweep it.
+        let mut index = MessageDedupIndex::new(16);
+        index.record_pending(key(1), 0, 100, 5, 0);
+        assert_eq!(
+            index.lookup(key(1), 100, WINDOW, 4),
+            Some(DedupMatch::Uncommitted { op: 5, checksum: 0 })
+        );
+        assert_eq!(index.lookup(key(1), 100, WINDOW, 5), None);
+        assert_eq!(index.lookup(key(1), 100, WINDOW, 9), None);
+    }
+
+    #[test]
+    fn truncation_rolls_back_pending_keys_and_never_committed_ones() {
+        let mut index = MessageDedupIndex::new(16);
+        index.record_committed(key(1), 0, 100, WINDOW);
+        index.record_pending(key(2), 1, 110, 4, 0);
+        index.record_pending(key(3), 2, 120, 5, 0);
+        index.record_pending(key(4), 3, 130, 6, 0);
+        index.truncate_from_op(5);
+        assert_eq!(
+            index.lookup(key(1), 130, WINDOW, 0),
+            Some(DedupMatch::Committed)
+        );
+        assert_eq!(
+            index.lookup(key(2), 130, WINDOW, 0),
+            Some(DedupMatch::Uncommitted { op: 4, checksum: 0 })
+        );
+        assert_eq!(index.lookup(key(3), 130, WINDOW, 0), None);
+        assert_eq!(index.lookup(key(4), 130, WINDOW, 0), None);
+        // Truncating below a committed op leaves it alone.
+        index.truncate_from_op(1);
+        assert_eq!(
+            index.lookup(key(1), 130, WINDOW, 0),
+            Some(DedupMatch::Committed)
+        );
+        assert_eq!(index.pending_len(), 0);
+    }
+
+    #[test]
+    fn re_recording_a_pending_op_takes_the_stamped_offset_in_place() {
+        let mut index = MessageDedupIndex::new(16);
+        index.record_pending(key(7), 100, 5_000, 9, 0);
+        index.record_pending(key(7), 104, 5_000, 9, 0);
+        assert_eq!(index.pending_len(), 1);
+        assert_eq!(index.pending_entry(key(7)).unwrap().offset, 104);
+        // A single sweep entry per recording, so the sweep cannot double-free.
+        index.sweep_committed_through(9);
+        assert_eq!(index.pending_len(), 0);
+    }
+
+    #[test]
+    fn a_newer_pending_occurrence_is_not_swept_by_an_older_commit() {
+        let mut index = MessageDedupIndex::new(16);
+        index.record_pending(key(1), 0, 100, 2, 0);
+        index.record_pending(key(1), 5, 200, 6, 0);
+        index.sweep_committed_through(3);
+        assert_eq!(index.pending_entry(key(1)).unwrap().op, 6);
+    }
+
+    #[test]
+    fn eviction_follows_the_newest_committed_timestamp_not_a_clock() {
+        let mut index = MessageDedupIndex::new(16);
+        index.record_committed(key(1), 0, 1_000, WINDOW);
+        index.record_committed(key(2), 1, 1_500, WINDOW);
+        assert_eq!(index.len(), 2);
+        index.record_committed(key(3), 2, 2_200, WINDOW);
+        assert!(index.committed_entry(key(1)).is_none());
+        assert!(index.committed_entry(key(2)).is_some());
+        assert_eq!(index.len(), 2);
+    }
+
+    #[test]
+    fn capacity_evicts_oldest_and_counts_live_evictions_as_saturation() {
+        let mut index = MessageDedupIndex::new(3);
+        for value in 0..5u128 {
+            index.record_committed(key(value), value as u64, 100 + value as u64, WINDOW);
+        }
+        assert_eq!(index.len(), 3);
+        assert!(index.committed_entry(key(0)).is_none() && index.committed_entry(key(1)).is_none());
+        assert!((2..5).all(|value| index.committed_entry(key(value)).is_some()));
+        assert_eq!(index.take_counters().evicted_live, 2);
+        assert_eq!(index.counters().evicted_live, 0, "take resets");
+    }
+
+    #[test]
+    fn rebuild_overlapping_the_commit_walk_keeps_one_entry() {
+        // A rebuild from storage and the commit walk (or WAL replay) can fold
+        // the same occurrence in either order; the index must not care.
+        let mut walked_first = MessageDedupIndex::new(16);
+        walked_first.record_committed(key(7), 50, 5_000, WINDOW);
+        walked_first.record_committed(key(7), 50, 5_000, WINDOW);
+        assert_eq!(walked_first.len(), 1);
+        assert_eq!(
+            walked_first.order.len(),
+            1,
+            "no stale queue item for a re-fold"
+        );
+        let mut once = MessageDedupIndex::new(16);
+        once.record_committed(key(7), 50, 5_000, WINDOW);
+        assert_eq!(walked_first.fingerprint(), once.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_depends_on_committed_content_only() {
+        // Two replicas at the same commit, one with an extra pending tail.
+        let log: Vec<(u128, u64, u64, u64)> = (0..200u128)
+            .map(|value| {
+                (
+                    value % 37,
+                    value as u64,
+                    1_000 + value as u64 * 7,
+                    1 + value as u64 / 4,
+                )
+            })
+            .collect();
+        let mut ahead = MessageDedupIndex::new(1_000);
+        let mut behind = MessageDedupIndex::new(1_000);
+        for (value, offset, timestamp, op) in &log {
+            ahead.record_pending(key(*value), offset + 1_000, *timestamp, *op, 0);
+            ahead.record_committed(key(*value), *offset, *timestamp, WINDOW);
+            behind.record_committed(key(*value), *offset, *timestamp, WINDOW);
+        }
+        ahead.record_pending(key(999), 5_000, 9_999, 999, 0);
+        assert_eq!(ahead.fingerprint(), behind.fingerprint());
+        assert_eq!(ahead.len(), behind.len());
+    }
+
+    #[test]
+    fn stale_order_items_do_not_grow_without_bound() {
+        let mut index = MessageDedupIndex::new(8);
+        for round in 0..10_000u64 {
+            index.record_committed(key(u128::from(round % 4)), round, 10_000, WINDOW);
+        }
+        assert_eq!(index.len(), 4);
+        assert!(
+            index.order.len() <= 64.max(index.len() * 2) + 1,
+            "{}",
+            index.order.len()
+        );
+    }
+
+    #[test]
+    fn clear_gives_the_memory_back_and_keeps_the_counters() {
+        // A disabled or reinstalled partition must not pin the tables a
+        // busy window grew (a Redpanda fork lesson: the index outlived dedup).
+        let mut index = MessageDedupIndex::new(100_000);
+        for value in 0..50_000u128 {
+            index.record_committed(key(value), value as u64, 1_000, WINDOW);
+        }
+        index.note_dropped(3);
+        assert!(index.allocated_bytes() > 50_000 * 32);
+        index.clear();
+        assert_eq!(index.allocated_bytes(), 0);
+        assert_eq!(index.counters().dropped, 3);
+        assert_eq!(index.entries_max(), 100_000);
+    }
+
+    #[test]
+    fn an_entry_costs_what_the_docs_and_the_config_comments_claim() {
+        // The cap is sized from these numbers ([partition]
+        // message_dedup_entries_max, iggy-raw-internal's values): a wider
+        // entry silently multiplies every partition's index.
+        assert_eq!(size_of::<(DedupKey, DedupEntry)>(), 32);
+        assert_eq!(size_of::<(u64, DedupKey)>(), 24);
+        let mut index = MessageDedupIndex::new(1 << 20);
+        for value in 0..(1u128 << 20) {
+            index.record_committed(key(value * 7_919), value as u64, 1_000, WINDOW);
+        }
+        let per_entry = index.allocated_bytes() / index.len();
+        assert!(
+            (33 + 24..=110).contains(&per_entry),
+            "{per_entry} bytes per entry"
+        );
+    }
+
+    #[test]
+    fn reserve_never_reaches_past_the_cap() {
+        let mut index = MessageDedupIndex::new(1_000);
+        index.reserve(1_000_000);
+        assert!(
+            index.committed.capacity() < 4_000,
+            "{}",
+            index.committed.capacity()
+        );
+    }
+
+    #[test]
+    fn message_id_identity_keys_on_the_id_and_skips_id_zero() {
+        let id = DedupIdentity::MessageId;
+        let block = headers(&[("dedup-key", STRING_KIND, b"ignored")]);
+        assert_eq!(
+            message_identity(&id, 42, &block),
+            message_identity(&id, 42, &[])
+        );
+        assert_ne!(
+            message_identity(&id, 42, &[]),
+            message_identity(&id, 43, &[])
+        );
+        assert_eq!(message_identity(&id, 0, &block), MessageIdentity::Unindexed);
+    }
+
+    #[test]
+    fn header_identity_without_its_header_is_missing_not_unindexed() {
+        let header = DedupIdentity::Header(DedupHeaderName::from_str("dedup-key").unwrap());
+        assert_eq!(message_identity(&header, 42, &[]), MessageIdentity::Missing);
+        assert_eq!(
+            message_identity(&header, 42, &headers(&[("other", STRING_KIND, b"v")])),
+            MessageIdentity::Missing
+        );
+        assert!(matches!(
+            message_identity(&header, 0, &headers(&[("dedup-key", STRING_KIND, b"v")])),
+            MessageIdentity::Key(_)
+        ));
+    }
+
+    #[test]
+    fn clear_resets_everything_including_the_eviction_reference() {
+        let mut index = MessageDedupIndex::new(8);
+        index.record_committed(key(1), 0, 50_000, WINDOW);
+        index.record_pending(key(3), 1, 50_000, 2, 0);
+        index.clear();
+        assert!(index.is_empty() && index.pending_len() == 0);
+        index.record_committed(key(2), 0, 100, WINDOW);
+        assert!(index.committed_entry(key(2)).is_some());
+    }
+
+    mod classify {
+        use server_common::send_messages::{SendMessagesOwned, decode_batch_slice};
+
+        use super::*;
+
+        fn batch_bytes(keys: &[Option<&str>]) -> Vec<u8> {
+            use bytes::Bytes;
+            use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
+            let mut messages = IggyMessages::with_capacity(keys.len());
+            for (index, value) in keys.iter().enumerate() {
+                messages.push(IggyMessage {
+                    header: IggyMessageHeader {
+                        id: index as u128 + 1,
+                        origin_timestamp: 1,
+                        ..Default::default()
+                    },
+                    payload: Bytes::from(format!("payload-{index}")),
+                    user_headers: value.map(|value| {
+                        Bytes::from(headers(&[("dedup-key", STRING_KIND, value.as_bytes())]))
+                    }),
+                });
+            }
+            let owned = SendMessagesOwned::from_messages(
+                server_common::sharding::IggyNamespace::new(1, 1, 0),
+                &messages,
+            )
+            .unwrap();
+            let mut out = vec![0u8; owned.header.total_size()];
+            owned
+                .header
+                .encode_into(&mut out[..server_common::send_messages::BATCH_HEADER_SIZE]);
+            out[server_common::send_messages::BATCH_HEADER_SIZE..].copy_from_slice(&owned.blob);
+            out
+        }
+
+        fn classify(keys: &[Option<&str>], index: &MessageDedupIndex, now: u64) -> BatchVerdict {
+            let bytes = batch_bytes(keys);
+            let batch = decode_batch_slice(&bytes).unwrap();
+            classify_batch(&batch, &policy("dedup-key"), index, now, 0, |_, _| false)
+        }
+
+        fn key_of(value: &str) -> DedupKey {
+            dedup_key(
+                &headers(&[("dedup-key", STRING_KIND, value.as_bytes())]),
+                &DedupHeaderName::from_str("dedup-key").unwrap(),
+            )
+            .unwrap()
+        }
+
+        #[test]
+        fn fresh_batch_keeps_everything() {
+            let verdict = classify(&[Some("a"), Some("b")], &MessageDedupIndex::new(8), 0);
+            assert!(verdict.keeps_all() && !verdict.missing_identity);
+            assert_eq!(verdict.keep, vec![true, true]);
+            assert_eq!(
+                verdict.kept_keys,
+                vec![Some(key_of("a")), Some(key_of("b"))]
+            );
+        }
+
+        #[test]
+        fn a_message_without_the_header_flags_the_whole_request() {
+            let verdict = classify(&[Some("a"), None, Some("b")], &MessageDedupIndex::new(8), 0);
+            assert!(verdict.missing_identity);
+        }
+
+        #[test]
+        fn message_id_mode_drops_a_resent_id_whatever_its_headers() {
+            // batch_bytes gives message i the ID i + 1.
+            let bytes = batch_bytes(&[Some("x"), None, Some("y")]);
+            let batch = decode_batch_slice(&bytes).unwrap();
+            let mut index = MessageDedupIndex::new(8);
+            index.record_committed(message_id_key(2), 0, 1_000, WINDOW);
+            let verdict = classify_batch(&batch, &id_policy(), &index, 1_000, 0, |_, _| false);
+            assert!(!verdict.missing_identity);
+            assert_eq!(verdict.keep, vec![true, false, true]);
+            let mut stamped = bytes.clone();
+            let mut header = server_common::send_messages::BatchHeader::decode(&stamped).unwrap();
+            header.base_offset = 10;
+            header.encode_into(&mut stamped[..server_common::send_messages::BATCH_HEADER_SIZE]);
+            let keys: Vec<DedupKey> = stamped_batch_keys(&id_policy(), &stamped)
+                .into_iter()
+                .map(|(key, _, _)| key)
+                .collect();
+            assert_eq!(
+                keys,
+                vec![message_id_key(1), message_id_key(2), message_id_key(3)]
+            );
+        }
+
+        #[test]
+        fn repeats_inside_one_batch_keep_the_first_only() {
+            let verdict = classify(
+                &[Some("a"), Some("a"), Some("b"), Some("a")],
+                &MessageDedupIndex::new(8),
+                0,
+            );
+            assert_eq!(verdict.keep, vec![true, false, true, false]);
+            assert_eq!(verdict.dropped, 2);
+            assert!(!verdict.matched_uncommitted);
+        }
+
+        #[test]
+        fn committed_live_keys_are_dropped_and_expired_ones_readmitted() {
+            let mut index = MessageDedupIndex::new(8);
+            index.record_committed(key_of("old"), 0, 100, WINDOW);
+            index.record_committed(key_of("new"), 1, 900, WINDOW);
+            let verdict = classify(&[Some("old"), Some("new"), Some("fresh")], &index, 1_500);
+            assert_eq!(verdict.keep, vec![true, false, true], "old expired at 1100");
+            assert!(!verdict.matched_uncommitted);
+        }
+
+        #[test]
+        fn a_pending_match_outside_the_pipeline_is_flagged_and_never_dropped() {
+            // An occurrence this primary cannot tie to its own pipeline (a
+            // stale entry, or one from another view) can still be truncated
+            // without taking this request with it: dropping against it could
+            // lose the event, so the caller defers the whole request instead.
+            let mut index = MessageDedupIndex::new(8);
+            index.record_pending(key_of("pending"), 5, 1_000, 9, 0);
+            index.record_committed(key_of("done"), 4, 1_000, WINDOW);
+            let verdict = classify(&[Some("pending"), Some("done"), Some("new")], &index, 1_000);
+            assert!(verdict.matched_uncommitted);
+            assert_eq!(verdict.keep, vec![true, false, true]);
+            assert_eq!((verdict.dropped_in_flight, verdict.wait_for_op), (0, None));
+        }
+
+        #[test]
+        fn a_match_in_flight_in_the_pipeline_is_dropped_and_waits_for_its_op() {
+            // Redundant producers send the same event within milliseconds.
+            // The second copy rides behind the first instead of being
+            // refused: its request cannot commit before op 9 does.
+            let bytes = batch_bytes(&[Some("first"), Some("second"), Some("new")]);
+            let batch = decode_batch_slice(&bytes).unwrap();
+            let mut index = MessageDedupIndex::new(8);
+            index.record_pending(key_of("first"), 5, 1_000, 9, 0x99);
+            index.record_pending(key_of("second"), 6, 1_000, 8, 0x88);
+            let in_pipeline = |op: u64, checksum: u128| {
+                (op, checksum) == (9, 0x99) || (op, checksum) == (8, 0x88)
+            };
+            let verdict =
+                classify_batch(&batch, &policy("dedup-key"), &index, 1_000, 0, in_pipeline);
+            assert!(!verdict.matched_uncommitted);
+            assert_eq!(verdict.keep, vec![false, false, true]);
+            assert_eq!((verdict.dropped, verdict.dropped_in_flight), (0, 2));
+            assert_eq!(verdict.wait_for_op, Some(9));
+            assert!(!verdict.keeps_all());
+        }
+
+        #[test]
+        fn a_pipeline_entry_with_another_checksum_does_not_vouch_for_the_match() {
+            // Same op number, different prepare: the entry is from a log
+            // suffix a view change replaced, so the match proves nothing.
+            let bytes = batch_bytes(&[Some("first")]);
+            let batch = decode_batch_slice(&bytes).unwrap();
+            let mut index = MessageDedupIndex::new(8);
+            index.record_pending(key_of("first"), 5, 1_000, 9, 0x99);
+            let verdict = classify_batch(
+                &batch,
+                &policy("dedup-key"),
+                &index,
+                1_000,
+                0,
+                |op, checksum| op == 9 && checksum == 0x77,
+            );
+            assert!(verdict.matched_uncommitted);
+            assert_eq!(verdict.keep, vec![true]);
+        }
+
+        #[test]
+        fn committed_batches_use_stamped_offsets_and_timestamp_and_sweep_pending() {
+            let mut bytes = batch_bytes(&[Some("a"), Some("skip"), Some("b")]);
+            let mut header = server_common::send_messages::BatchHeader::decode(&bytes).unwrap();
+            header.base_offset = 40;
+            header.base_timestamp = 7_000;
+            header.encode_into(&mut bytes[..server_common::send_messages::BATCH_HEADER_SIZE]);
+            let mut index = MessageDedupIndex::new(8);
+            record_pending_batch(&mut index, &policy("dedup-key"), &bytes, 11, 0);
+            assert_eq!(index.pending_len(), 3);
+            record_committed_batch(&mut index, &policy("dedup-key"), &bytes, 11);
+            let a = index.committed_entry(key_of("a")).unwrap();
+            let b = index.committed_entry(key_of("b")).unwrap();
+            assert_eq!((a.offset, a.timestamp), (40, 7_000));
+            assert_eq!((b.offset, b.timestamp), (42, 7_000));
+            assert_eq!((index.len(), index.pending_len()), (3, 0));
+        }
+    }
+}
+
+#[cfg(test)]
+mod budget_and_sweep_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use super::*;
+
+    const WINDOW: u64 = 1_000;
+
+    fn key(value: u128) -> DedupKey {
+        DedupKey::from_raw(value)
+    }
+
+    fn shared(entries_max: usize, budget: &Rc<DedupBudget>) -> Rc<RefCell<MessageDedupIndex>> {
+        let index = Rc::new(RefCell::new(MessageDedupIndex::new(entries_max)));
+        budget.register(&index);
+        index
+    }
+
+    /// Fold `count` keys starting at `first`, one per offset, all at `timestamp`.
+    fn fold(index: &RefCell<MessageDedupIndex>, first: u128, count: u64, timestamp: u64) {
+        let mut index = index.borrow_mut();
+        for n in 0..count {
+            index.record_committed(key(first + u128::from(n)), n, timestamp, WINDOW);
+        }
+    }
+
+    #[test]
+    fn the_shard_budget_bounds_the_sum_of_partition_indexes() {
+        // Four partitions each well under their own cap still add up past the
+        // shard's memory: the budget is what keeps the node alive.
+        let budget = Rc::new(DedupBudget::new(1_000));
+        let indexes: Vec<_> = (0..4).map(|_| shared(10_000, &budget)).collect();
+        for (n, index) in indexes.iter().enumerate() {
+            fold(index, (n as u128) << 32, 600, 500);
+        }
+        let held: usize = indexes.iter().map(|index| index.borrow().len()).sum();
+        assert_eq!(held, budget.entries());
+        assert!(budget.entries() <= 1_000, "{} > budget", budget.entries());
+    }
+
+    #[test]
+    fn at_the_budget_the_largest_index_gives_up_entries_not_a_small_one() {
+        // A small partition keeps its whole window while a busy one at the
+        // budget pays for its own growth.
+        let budget = Rc::new(DedupBudget::new(1_000));
+        let small = shared(10_000, &budget);
+        let busy = shared(10_000, &budget);
+        fold(&small, 1 << 40, 100, 500);
+        fold(&busy, 1 << 50, 5_000, 500);
+        assert_eq!(small.borrow().len(), 100);
+        assert!(busy.borrow().len() <= 900);
+        assert!(busy.borrow_mut().take_counters().evicted_budget > 0);
+        assert_eq!(small.borrow_mut().take_counters().evicted_budget, 0);
+    }
+
+    #[test]
+    fn a_new_partition_trims_the_largest_other_index_not_itself() {
+        let budget = Rc::new(DedupBudget::new(1_000));
+        let old = shared(10_000, &budget);
+        fold(&old, 1 << 40, 1_000, 500);
+        let new = shared(10_000, &budget);
+        fold(&new, 1 << 50, 200, 600);
+        assert_eq!(new.borrow().len(), 200, "the newcomer keeps what it folded");
+        assert!(old.borrow().len() + 200 <= 1_000);
+    }
+
+    #[test]
+    fn dropping_or_clearing_an_index_returns_its_entries_to_the_budget() {
+        let budget = Rc::new(DedupBudget::new(0));
+        let first = shared(10_000, &budget);
+        let second = shared(10_000, &budget);
+        fold(&first, 1, 300, 500);
+        fold(&second, 1 << 40, 200, 500);
+        assert_eq!(budget.entries(), 500);
+        second.borrow_mut().clear();
+        assert_eq!(budget.entries(), 300);
+        drop(first);
+        assert_eq!(budget.entries(), 0);
+    }
+
+    #[test]
+    fn eviction_works_off_a_burst_a_bounded_pass_at_a_time() {
+        // A burst aging out at once must not stall the reactor: each commit
+        // removes at most EVICT_STEP_MAX entries, and the rest go later.
+        let mut index = MessageDedupIndex::new(1 << 20);
+        let burst = (EVICT_STEP_MAX * 3) as u64;
+        for n in 0..burst {
+            index.record_committed(key(u128::from(n)), n, 100, WINDOW);
+        }
+        index.record_committed(key(1 << 60), burst, 100 + WINDOW + 1, WINDOW);
+        assert_eq!(index.len() as u64, burst + 1 - EVICT_STEP_MAX as u64);
+        for n in 1..=2u64 {
+            index.record_committed(
+                key((1 << 60) + u128::from(n)),
+                burst + n,
+                100 + WINDOW + 1,
+                WINDOW,
+            );
+        }
+        assert_eq!(index.len(), 3, "later passes finish the expiry");
+    }
+
+    #[test]
+    fn a_lowered_cap_is_reached_over_later_passes() {
+        let mut index = MessageDedupIndex::new(1 << 20);
+        for n in 0..(EVICT_STEP_MAX as u64 * 2) {
+            index.record_committed(key(u128::from(n)), n, 500, WINDOW);
+        }
+        index.set_entries_max(10, WINDOW);
+        assert_eq!(index.len(), EVICT_STEP_MAX);
+        index.expire_idle(500, WINDOW);
+        assert_eq!(index.len(), 10);
+        assert_eq!(
+            index.counters().evicted_live,
+            (EVICT_STEP_MAX as u64 * 2) - 10
+        );
+    }
+
+    #[test]
+    fn the_idle_sweep_drops_only_entries_no_request_could_still_match() {
+        // A partition that stopped receiving keeps its newest timestamp, so
+        // without the sweep its window of keys would stay resident forever.
+        let mut index = MessageDedupIndex::new(64);
+        index.record_committed(key(1), 0, 1_000, WINDOW);
+        index.record_committed(key(2), 1, 1_500, WINDOW);
+        // At 2_000 the first entry's window just ended (1_000 + 1_000 is not
+        // > 2_000) and the second is still live.
+        assert_eq!(index.expire_idle(2_000, WINDOW), 1);
+        assert_eq!(index.lookup(key(1), 2_000, WINDOW, 0), None);
+        assert_eq!(
+            index.lookup(key(2), 2_000, WINDOW, 0),
+            Some(DedupMatch::Committed)
+        );
+        // Nothing is dead before the window could have ended.
+        let mut young = MessageDedupIndex::new(64);
+        young.record_committed(key(1), 0, 0, WINDOW);
+        assert_eq!(young.expire_idle(WINDOW - 1, WINDOW), 0);
+    }
+
+    #[test]
+    fn replicas_that_swept_at_different_times_agree_on_live_entries() {
+        let mut swept = MessageDedupIndex::new(64);
+        let mut unswept = MessageDedupIndex::new(64);
+        for index in [&mut swept, &mut unswept] {
+            index.record_committed(key(1), 0, 1_000, WINDOW);
+            index.record_committed(key(2), 1, 1_900, WINDOW);
+        }
+        swept.expire_idle(2_500, WINDOW);
+        assert_ne!(swept.fingerprint(), unswept.fingerprint());
+        assert_eq!(
+            swept.fingerprint_live(2_500, WINDOW),
+            unswept.fingerprint_live(2_500, WINDOW)
+        );
+    }
+
+    #[test]
+    fn identities_hash_in_one_pass_and_keep_kinds_apart() {
+        // The kind seeds the hash, so the same bytes as String and as Raw are
+        // distinct identities, as they were with the streaming hasher.
+        let string = XxHash3_128::oneshot_with_seed(2, b"event-1");
+        let raw = XxHash3_128::oneshot_with_seed(1, b"event-1");
+        assert_ne!(string, raw);
+        assert_eq!(message_id_key(7), message_id_key(7));
+        assert_ne!(message_id_key(7), message_id_key(8));
+    }
+}
