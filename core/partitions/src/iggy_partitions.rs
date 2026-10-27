@@ -123,6 +123,10 @@ where
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
     repair_memory: Option<Arc<crate::RepairMemoryBudget>>,
     loopback_ready: Rc<LoopbackReady>,
+    /// The shard-wide content-dedup budget every partition's index counts
+    /// against; see [`crate::message_dedup::DedupBudget`]. Off (limit 0) until
+    /// [`Self::set_message_dedup_shard_budget`].
+    message_dedup_budget: Rc<crate::message_dedup::DedupBudget>,
     /// Debug-only tripwire: counts live [`Self::with_partition`] borrows so
     /// `insert` / `remove` can assert the partitions vec is never mutated
     /// while a sanctioned non-pump read borrow is outstanding. Cannot fire for
@@ -170,6 +174,7 @@ where
             io_notifier: RefCell::new(None),
             repair_memory: None,
             loopback_ready: Rc::default(),
+            message_dedup_budget: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -193,6 +198,7 @@ where
             io_notifier: RefCell::new(None),
             repair_memory: None,
             loopback_ready: Rc::default(),
+            message_dedup_budget: Rc::default(),
             #[cfg(debug_assertions)]
             borrow_active: Cell::new(0),
         }
@@ -209,6 +215,19 @@ where
         let mut partitions = Self::with_capacity(shard_id, config, capacity);
         partitions.repair_memory = Some(budget);
         partitions
+    }
+
+    /// Hold the content-dedup indexes of this shard's partitions to `limit`
+    /// committed entries in all (`[partition] message_dedup_entries_per_shard_max`,
+    /// 0 for no limit).
+    pub fn set_message_dedup_shard_budget(&self, limit: usize) {
+        self.message_dedup_budget.set_limit(limit);
+    }
+
+    /// The shard's content-dedup budget, for its gauges.
+    #[must_use]
+    pub fn message_dedup_budget(&self) -> &crate::message_dedup::DedupBudget {
+        &self.message_dedup_budget
     }
 
     /// This node's key-encryption keys, for wrapping new stream keys.
@@ -419,6 +438,7 @@ where
             &self.consumer_group_offsets_reconcile_epoch,
         ));
         partition.set_fence_published_flag(Rc::clone(&self.fence_published));
+        partition.set_message_dedup_budget(&self.message_dedup_budget);
         self.teardown
             .borrow_mut()
             .insert(namespace, partition.teardown_handle());
