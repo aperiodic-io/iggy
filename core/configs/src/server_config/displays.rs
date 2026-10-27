@@ -64,6 +64,7 @@ impl Display for PartitionConfig {
         write!(
             f,
             "{{ wal_bytes_max: {}, wal_group_commit_delay_micros: {}, validate_checksum: {}, prepare_queue_depth: {}, dedup_clients_max: {}, consumer_offsets_max: {}, \
+             message_dedup_entries_max: {}, message_dedup_entries_per_shard_max: {}, \
              offset_reservation_lease: {}, \
              evicted_ring_capacity: {}, evicted_ring_bytes_max: {}, \
              transfer_served_cache_bytes_max: {}, transfer_artifact_bytes_max: {} }}",
@@ -73,6 +74,8 @@ impl Display for PartitionConfig {
             self.prepare_queue_depth,
             self.dedup_clients_max,
             self.consumer_offsets_max,
+            self.message_dedup_entries_max,
+            self.message_dedup_entries_per_shard_max,
             self.offset_reservation_lease,
             self.evicted_ring_capacity,
             self.evicted_ring_bytes_max,

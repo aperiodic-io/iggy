@@ -156,6 +156,18 @@ fn default_consumer_offsets_max() -> usize {
     PARTITION_CONSUMER_OFFSETS_DEFAULT
 }
 
+/// Default for `[partition] message_dedup_entries_max`.
+pub const PARTITION_MESSAGE_DEDUP_ENTRIES_DEFAULT: usize = 1_000_000;
+/// Ceiling for `[partition] message_dedup_entries_max` (~1 GiB per partition).
+pub const PARTITION_MESSAGE_DEDUP_ENTRIES_CEILING: usize = 1 << 24;
+
+fn default_message_dedup_entries_max() -> usize {
+    PARTITION_MESSAGE_DEDUP_ENTRIES_DEFAULT
+}
+
+/// Ceiling for `[partition] message_dedup_entries_per_shard_max`.
+pub const PARTITION_MESSAGE_DEDUP_ENTRIES_PER_SHARD_CEILING: usize = 1 << 28;
+
 pub const DEFAULT_PARTITION_WAL_BYTES_MAX: u64 = 256 * 1024 * 1024;
 pub const MIN_PARTITION_WAL_BYTES_MAX: u64 = 2 * (64 * 1024 * 1024 + 4096);
 pub const MAX_PARTITION_WAL_BYTES_MAX: u64 = 4 * 1024 * 1024 * 1024;
@@ -221,6 +233,22 @@ pub struct PartitionConfig {
     /// partition primary. Existing keys remain writable at the limit.
     #[serde(default = "default_consumer_offsets_max")]
     pub consumer_offsets_max: usize,
+
+    /// Distinct message-dedup keys each partition keeps for a topic with a
+    /// `dedup_window`. At the cap the oldest keys are evicted even inside the
+    /// window, which weakens deduplication but never loses a message. Must be
+    /// > 0 and <= [`PARTITION_MESSAGE_DEDUP_ENTRIES_CEILING`].
+    #[serde(default = "default_message_dedup_entries_max")]
+    pub message_dedup_entries_max: usize,
+
+    /// Distinct message-dedup keys all deduplicating partitions of one shard
+    /// keep together. Shards balance partition counts, not index sizes, so
+    /// per-partition caps alone can add up past the node's memory. At the
+    /// budget the largest index on the shard gives up its oldest keys. 0
+    /// means no shard budget. Must be <=
+    /// [`PARTITION_MESSAGE_DEDUP_ENTRIES_PER_SHARD_CEILING`].
+    #[serde(default)]
+    pub message_dedup_entries_per_shard_max: usize,
 
     /// Offsets claimed in the superblock ahead of the mint counter before an
     /// append, so a crash-restarted replica resumes above what it confirmed.
@@ -329,6 +357,26 @@ impl Validatable<ConfigurationError> for PartitionConfig {
                 "{COMPONENT} partition.consumer_offsets_max ({}) must be > 0 and <= \
                  {PARTITION_CONSUMER_OFFSETS_CEILING}",
                 self.consumer_offsets_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.message_dedup_entries_max == 0
+            || self.message_dedup_entries_max > PARTITION_MESSAGE_DEDUP_ENTRIES_CEILING
+        {
+            eprintln!(
+                "{COMPONENT} partition.message_dedup_entries_max ({}) must be > 0 and <= \
+                 {PARTITION_MESSAGE_DEDUP_ENTRIES_CEILING}",
+                self.message_dedup_entries_max
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.message_dedup_entries_per_shard_max
+            > PARTITION_MESSAGE_DEDUP_ENTRIES_PER_SHARD_CEILING
+        {
+            eprintln!(
+                "{COMPONENT} partition.message_dedup_entries_per_shard_max ({}) must be <= \
+                 {PARTITION_MESSAGE_DEDUP_ENTRIES_PER_SHARD_CEILING}",
+                self.message_dedup_entries_per_shard_max
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
