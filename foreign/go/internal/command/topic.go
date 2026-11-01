@@ -138,6 +138,15 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 	if options.ReplicationFactor != nil {
 		typed = append(typed, iggcon.ReplicationFactorOption(*options.ReplicationFactor))
 	}
+	if options.DedupWindow != nil {
+		typed = append(typed, iggcon.DedupWindowOption(*options.DedupWindow))
+	}
+	if options.DedupHeader != nil {
+		typed = append(typed, iggcon.DedupHeaderOption(*options.DedupHeader))
+	}
+	if options.DedupIdentity != nil {
+		typed = append(typed, iggcon.DedupIdentityOption(*options.DedupIdentity))
+	}
 	return typed, nil
 }
 

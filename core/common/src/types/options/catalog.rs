@@ -15,22 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::codec::{OptionValueCodec, invalid};
+use super::codec::{OptionValueCodec, decode_dedup_identity, invalid};
 use super::key::OptionKey;
 use super::{
     DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
     DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
-    MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE,
-    MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions,
-    erase_options,
+    DedupHeaderName, Durability, MAX_DEDUP_HEADER_LENGTH, MAX_DEDUP_WINDOW_MICROS,
+    MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR,
+    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE,
+    OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
 use crate::utils::stream_key::{StreamEncryptionKey, StreamKeyOrigin, WrapSet};
 use crate::wire_conversions::options_block_size;
-use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
+use crate::{IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 use iggy_binary_protocol::{WireHeaderKind, WireOptions, WireUserHeaderEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,7 +68,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 20] = [
+pub static CATALOG: [OptionDescriptor; 23] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -298,6 +298,59 @@ pub static CATALOG: [OptionDescriptor; 20] = [
                  stops writing while either is down, and 1 keeps one copy that replicated \
                  durability acknowledges before it reaches disk"
             )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::DedupWindow,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            format!(
+                "Drop a message whose identity (dedup_identity) was already appended to the \
+                 same partition within this window, measured on prepare timestamps: \
+                 microseconds or a humantime string (e.g. 5m). Absent or 0 disables \
+                 deduplication. At most {MAX_DEDUP_WINDOW_MICROS} microseconds. Requires \
+                 dedup_header unless dedup_identity is message_id"
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::DedupHeader,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            format!(
+                "User-header key whose value identifies a message for dedup_window, matched \
+                 byte for byte, 1 to {MAX_DEDUP_HEADER_LENGTH} bytes. A request carrying a \
+                 message without it is refused"
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::DedupIdentity,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "What identifies a message for dedup_window: header (the dedup_header value, the \
+             default) or message_id (the message's own ID; ID 0 is never deduplicated, and \
+             SDKs replace an unset ID with a random one). dedup_header must be absent with \
+             message_id"
+                .to_owned()
         },
     },
     OptionDescriptor {
@@ -808,6 +861,9 @@ pub fn canonical_value(
             u32::decode(key, entry)?.encode()?
         }
         OptionKey::PreallocateSegments => bool::decode(key, entry)?.encode()?,
+        OptionKey::DedupWindow => IggyDuration::decode(key, entry)?.encode()?,
+        OptionKey::DedupHeader => DedupHeaderName::decode(key, entry)?.encode()?,
+        OptionKey::DedupIdentity => HeaderValue::try_from(decode_dedup_identity(key, entry)?)?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }
